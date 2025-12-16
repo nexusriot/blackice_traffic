@@ -4,4 +4,4 @@
 __pycache__/
 build/
 dist/
-
+GeoLite2-City.mmdb

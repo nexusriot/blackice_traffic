@@ -6,11 +6,11 @@ import time
 import json
 import random
 import socket
-import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import psutil
+import ipaddress
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # Map tab requires QtWebEngine (separate pkg)
@@ -310,22 +310,73 @@ class ConnScanner(QtCore.QThread):
     def stop(self):
         self._stop = True
 
-    def _geo_lookup(self, ip: str) -> Tuple[float, float, str]:
-        # Offline GeoIP if available and db configured
+    def _normalize_ip(self, ip: str) -> str:
+        # Normalize IPv4-mapped IPv6 like ::ffff:127.0.0.1 → 127.0.0.1
+        if ip.startswith("::ffff:"):
+            v4 = ip.split("::ffff:", 1)[1]
+            # Sometimes it can be hex-ish, but psutil normally gives dotted quad.
+            return v4
+        return ip
+
+    def _is_privateish(self, ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+            return (
+                    addr.is_private
+                    or addr.is_loopback
+                    or addr.is_link_local
+                    or addr.is_multicast
+                    or addr.is_reserved
+            )
+        except Exception:
+            return True  # if we can't parse, treat as non-public
+
+    def _geo_lookup(self, ip: str) -> Tuple[Optional[float], Optional[float], str]:
+        ip = self._normalize_ip(ip)
+
+        # Classify local/private early
+        if self._is_privateish(ip):
+            # Better label than "GeoIP unavailable"
+            try:
+                addr = ipaddress.ip_address(ip)
+                if addr.is_loopback:
+                    return None, None, "LOCAL LOOPBACK"
+                if addr.is_private:
+                    return None, None, "LOCAL RFC1918 / PRIVATE"
+                if addr.is_link_local:
+                    return None, None, "LOCAL LINK-LOCAL"
+            except Exception:
+                pass
+            return None, None, "LOCAL / NON-PUBLIC"
+
+        # Offline GeoIP if available
         global _geoip_reader
         if HAVE_GEOIP and _geoip_reader is not None:
             try:
                 r = _geoip_reader.city(ip)
-                lat = float(r.location.latitude or 0.0)
-                lon = float(r.location.longitude or 0.0)
-                city = r.city.name or ""
-                cc = r.country.iso_code or ""
-                label = f"{city} {cc}".strip() or cc or "Unknown"
-                return lat, lon, label
+
+                country = (r.country.iso_code or "").strip()
+                city = (r.city.name or "").strip()
+                region = ""
+                if r.subdivisions and len(r.subdivisions) > 0:
+                    region = (r.subdivisions.most_specific.name or "").strip()
+
+                lat = r.location.latitude
+                lon = r.location.longitude
+
+                # Build best-effort label
+                parts = [p for p in [city, region, country] if p]
+                label = " ".join(parts) if parts else (country or "Unknown")
+
+                # Some records have no coords
+                if lat is None or lon is None:
+                    return None, None, label
+
+                return float(lat), float(lon), label
             except Exception:
                 pass
-        # fallback
-        return 0.0, 0.0, "GeoIP unavailable"
+
+        return None, None, "GeoIP unavailable"
 
     def _scan_psutil(self) -> List[ConnPoint]:
         out: List[ConnPoint] = []
@@ -351,9 +402,11 @@ class ConnScanner(QtCore.QThread):
                 continue
             self._seen[key] = now
 
-            lat, lon, where = self._geo_lookup(ip)
-            label = f"{ip}:{port} ({proto}) — {where}"
-            out.append(ConnPoint(ip=ip, port=port, proto=proto, lat=lat, lon=lon, label=label, ts=now))
+            norm_ip = self._normalize_ip(ip)
+            lat, lon, where = self._geo_lookup(norm_ip)
+            label = f"{norm_ip}:{port} ({proto}) — {where}"
+            out.append(ConnPoint(ip=norm_ip, port=port, proto=proto,
+                                 lat=lat or 0.0, lon=lon or 0.0, label=label, ts=now))
 
         return out
 
@@ -608,16 +661,29 @@ class MapTab(QtWidgets.QWidget):
         layout.addWidget(split, 1)
 
     def push_points(self, points: List[dict]):
-        # right-side list
+        # right-side list (keep everything)
         lines = []
         for p in points:
-            lines.append(f"{time.strftime('%H:%M:%S')}  {p.get('label','')}  @ ({p.get('lat',0):.3f},{p.get('lon',0):.3f})")
+            lines.append(
+                f"{time.strftime('%H:%M:%S')}  {p.get('label', '')}  @ ({p.get('lat', 0):.3f},{p.get('lon', 0):.3f})"
+            )
         if lines:
             self.list.appendPlainText("\n".join(lines))
 
-        # map markers
+        # map markers (only real coords)
         if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
-            payload = json.dumps(points)
+            map_points = []
+            for p in points:
+                lat = float(p.get("lat", 0.0) or 0.0)
+                lon = float(p.get("lon", 0.0) or 0.0)
+                if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+                    continue
+                map_points.append(p)
+
+            if not map_points:
+                return
+
+            payload = json.dumps(map_points)
             js = f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});"
             self.web.page().runJavaScript(js)
 
