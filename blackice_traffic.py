@@ -771,7 +771,7 @@ def init_geoip():
         return
     db = os.environ.get("GEOIP_DB", "").strip()
     if not db:
-        return
+        db = "./GeoLite2-City.mmdb"
     if not os.path.exists(db):
         return
     try:
