@@ -8,10 +8,16 @@ import random
 import socket
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
+import urllib.request
+import urllib.error
 import psutil
 import ipaddress
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+APP_NAME = "BLACK ICE DEFENDER"
+APP_VERSION = "0.3.0"
+APP_BUILD = "alpha"
+
 
 # Map tab requires QtWebEngine (separate pkg)
 try:
@@ -448,6 +454,9 @@ class BlackIceDashboard(QtWidgets.QWidget):
         self.scan = ScanlinesOverlay(self)
 
         self.title = QtWidgets.QLabel("BLACK ICE  — TRAFFIC SENTINEL")
+        self.version = QtWidgets.QLabel(f"v{APP_VERSION} · {APP_BUILD}")
+        self.version.setFont(HackerFont.mono(9))
+        self.version.setStyleSheet("color:#00aa44;")
         self.title.setFont(HackerFont.mono(16, bold=True))
         self.title.setStyleSheet("color: #00ff66; letter-spacing: 1px;")
 
@@ -479,6 +488,8 @@ class BlackIceDashboard(QtWidgets.QWidget):
 
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.title)
+        top.addSpacing(12)
+        top.addWidget(self.version)
         top.addStretch(1)
         top.addWidget(QtWidgets.QLabel("INTERFACE:"))
         lbl = top.itemAt(top.count()-1).widget()
@@ -574,11 +585,57 @@ LEAFLET_HTML = r"""
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
   const map = L.map('map', { zoomControl: true }).setView([20, 0], 2);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-     maxZoom: 19
-  }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 
   const markers = new Map();
+
+  // "Me" marker + rays
+  let me = null;            // {lat, lon, label}
+  let meMarker = null;
+  let rayLayer = L.layerGroup().addTo(map);
+
+  function setMyLocation(obj) {
+    // obj: {lat, lon, label}
+    if (!obj || obj.lat == null || obj.lon == null) return;
+    me = { lat: obj.lat, lon: obj.lon, label: obj.label || "ME" };
+
+    if (!meMarker) {
+      meMarker = L.circleMarker([me.lat, me.lon], {
+        radius: 8,
+        weight: 2,
+        color: "#ff9900",
+        fillColor: "#ff9900",
+        fillOpacity: 0.35
+      }).addTo(map);
+      meMarker.bindPopup(me.label);
+    } else {
+      meMarker.setLatLng([me.lat, me.lon]);
+      meMarker.setPopupContent(me.label);
+    }
+  }
+
+  function clearRays() {
+    rayLayer.clearLayers();
+  }
+
+  function redrawRays() {
+    clearRays();
+    if (!me) return;
+
+    // draw rays to every marker we have
+    for (const [key, m] of markers.entries()) {
+      const ll = m.getLatLng();
+      // ignore unknowns (0,0) if they slip in
+      if (Math.abs(ll.lat) < 1e-6 && Math.abs(ll.lng) < 1e-6) continue;
+
+      const line = L.polyline([[me.lat, me.lon], [ll.lat, ll.lng]], {
+        color: "#ff9900",
+        weight: 1.6,
+        opacity: 0.55
+      });
+      line.addTo(rayLayer);
+    }
+  }
 
   function upsertPoints(points) {
     for (const p of points) {
@@ -603,9 +660,10 @@ LEAFLET_HTML = r"""
         markers.set(key, m);
       }
     }
+    redrawRays();
   }
 
-  window.BLACKICE = { upsertPoints };
+  window.BLACKICE = { upsertPoints, setMyLocation, redrawRays, clearRays };
 </script>
 </body>
 </html>
@@ -660,8 +718,139 @@ class MapTab(QtWidgets.QWidget):
         layout.addWidget(self.hint)
         layout.addWidget(split, 1)
 
+        self.version = QtWidgets.QLabel(f"{APP_NAME} v{APP_VERSION}")
+        self.version.setFont(HackerFont.mono(8))
+        self.version.setStyleSheet("color:#0b2a12;")
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.addStretch(1)
+        footer.addWidget(self.version)
+
+        layout.addLayout(footer)
+
+        self.me_enable = QtWidgets.QCheckBox("Show my location + rays")
+        self.me_enable.setFont(HackerFont.mono(10))
+        self.me_enable.setStyleSheet("color:#ffcc33;")  # readable on dark
+
+        self.me_refresh = QtWidgets.QPushButton("Locate me now")
+        self.me_refresh.setFont(HackerFont.mono(10))
+        self.me_refresh.setStyleSheet(
+            "QPushButton { background:#07100a; color:#ff9900; border:1px solid #0b2a12; padding:6px 10px; }"
+            "QPushButton:hover { border:1px solid #ff9900; }"
+        )
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.me_enable)
+        row.addWidget(self.me_refresh)
+        row.addStretch(1)
+
+        # Insert into layout, e.g. after hint:
+        layout.addLayout(row)
+        self.me_enable.toggled.connect(self._on_me_toggled)
+        self.me_refresh.clicked.connect(self.locate_me)
+        self._me_obj = None  # cache {lat, lon, label}
+
+    def _js(self, code: str):
+        if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
+            self.web.page().runJavaScript(code)
+
+    def _get_public_ip(self) -> Optional[str]:
+        # Try a couple providers (plain text)
+        urls = [
+            "https://ifconfig.co/ip",
+            "https://api.ipify.org",
+        ]
+        headers = {"User-Agent": "blackice-defender/1.0"}
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    ip = r.read().decode("utf-8", "replace").strip()
+                    if ip:
+                        return ip
+            except Exception:
+                continue
+        return None
+
+    def _geo_online_ipapi(self) -> Tuple[Optional[float], Optional[float], str]:
+        # Online fallback: ipapi.co/json
+        try:
+            req = urllib.request.Request(
+                "https://ipapi.co/json/",
+                headers={"User-Agent": "blackice-defender/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+                lat = data.get("latitude")
+                lon = data.get("longitude")
+                city = (data.get("city") or "").strip()
+                country = (data.get("country_code") or "").strip()
+                label = " ".join([p for p in [city, country] if p]) or "ME"
+                if lat is None or lon is None:
+                    return None, None, label
+                return float(lat), float(lon), label
+        except Exception:
+            return None, None, "ME"
+
+    def locate_me(self):
+        """
+        Resolve "my location".
+        Priority:
+          1) Your existing GeoLite2-City mmdb via geoip2 (offline) using public IP
+          2) Online ipapi.co/json fallback
+        """
+        lat = lon = None
+        label = "ME"
+
+        # If offline GeoIP is available, use public IP + mmdb
+        if HAVE_GEOIP and _geoip_reader is not None:
+            ip = self._get_public_ip()
+            if ip:
+                try:
+                    r = _geoip_reader.city(ip)
+                    lat = r.location.latitude
+                    lon = r.location.longitude
+                    city = (r.city.name or "").strip()
+                    cc = (r.country.iso_code or "").strip()
+                    label = " ".join([p for p in [city, cc] if p]) or (cc or "ME")
+                    if lat is not None and lon is not None:
+                        lat = float(lat);
+                        lon = float(lon)
+                except Exception:
+                    lat = lon = None
+
+        # Online fallback if still unknown
+        if lat is None or lon is None:
+            lat, lon, label2 = self._geo_online_ipapi()
+            label = label2 or label
+
+        if lat is None or lon is None:
+            self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  [!] failed to locate ME")
+            self._me_obj = None
+            return
+
+        self._me_obj = {"lat": lat, "lon": lon, "label": f"ME — {label}"}
+        self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  [*] ME located: {label} @ ({lat:.3f},{lon:.3f})")
+
+        # Push into map immediately if enabled
+        if self.me_enable.isChecked():
+            payload = json.dumps(self._me_obj)
+            self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
+
+    def _on_me_toggled(self, enabled: bool):
+        if not enabled:
+            # just clear rays; keep markers
+            self._js("window.BLACKICE && window.BLACKICE.clearRays();")
+            return
+        # enabled
+        if self._me_obj is None:
+            self.locate_me()
+        else:
+            payload = json.dumps(self._me_obj)
+            self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
+
     def push_points(self, points: List[dict]):
-        # right-side list (keep everything)
+        # right-side list
         lines = []
         for p in points:
             lines.append(
@@ -670,7 +859,6 @@ class MapTab(QtWidgets.QWidget):
         if lines:
             self.list.appendPlainText("\n".join(lines))
 
-        # map markers (only real coords)
         if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
             map_points = []
             for p in points:
@@ -680,18 +868,20 @@ class MapTab(QtWidgets.QWidget):
                     continue
                 map_points.append(p)
 
-            if not map_points:
-                return
+            if map_points:
+                payload = json.dumps(map_points)
+                js = f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});"
+                self.web.page().runJavaScript(js)
 
-            payload = json.dumps(map_points)
-            js = f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});"
-            self.web.page().runJavaScript(js)
+            # ensure rays follow updates (only if ME enabled & set)
+            if self.me_enable.isChecked() and self._me_obj is not None:
+                self._js("window.BLACKICE && window.BLACKICE.redrawRays();")
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BLACK ICE DEFENDER — Traffic Visualizer")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} ({APP_BUILD}) — Traffic Visualizer")
         self.resize(1200, 780)
 
         # global stylesheet
@@ -728,6 +918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dash.set_event("[*] boot sequence complete")
         self.dash.set_event("[*] traffic sensors online")
         self.dash.set_event("[*] net trace scanner armed")
+        self.dash.set_event(f"[*] {APP_NAME} v{APP_VERSION} ({APP_BUILD}) initialized")
 
         # small UI timer to keep interface list fresh
         self._ui_timer = QtCore.QTimer(self)
