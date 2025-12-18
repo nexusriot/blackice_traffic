@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Blackice Traffic
+GenericName=blackice_traffic
+Exec=/usr/bin/blackice_traffic %U
+Terminal=false
+Icon=/usr/lib/blackice_traffic/icon.png
+Type=Application
+Categories=Application;Network;
+Comment=Blackice Network Traffic Monitor

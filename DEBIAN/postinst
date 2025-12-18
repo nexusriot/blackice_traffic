@@ -1,0 +1,3 @@
+#!/bin/sh
+
+mv /usr/lib/blackice_traffic/blackice_traffic.desktop /usr/share/applications/blackice_traffic.desktop

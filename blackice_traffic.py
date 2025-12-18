@@ -14,7 +14,7 @@ import psutil
 import ipaddress
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-APP_NAME = "BLACK ICE DEFENDER"
+APP_NAME = "BLACK ICE"
 APP_VERSION = "0.3.0"
 APP_BUILD = "alpha"
 
@@ -796,8 +796,8 @@ class MapTab(QtWidgets.QWidget):
         """
         Resolve "my location".
         Priority:
-          1) Your existing GeoLite2-City mmdb via geoip2 (offline) using public IP
-          2) Online ipapi.co/json fallback
+          - Existing GeoLite2-City mmdb via geoip2 (offline) using public IP
+          - Online ipapi.co/json fallback
         """
         lat = lon = None
         label = "ME"
@@ -963,6 +963,9 @@ def init_geoip():
     db = os.environ.get("GEOIP_DB", "").strip()
     if not db:
         db = "./GeoLite2-City.mmdb"
+    if not os.path.exists(db):
+        db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "./GeoLite2-City.mmdb")
     if not os.path.exists(db):
         return
     try:

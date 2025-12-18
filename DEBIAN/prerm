@@ -1,0 +1,4 @@
+#!/bin/sh
+
+rm /usr/share/applications/blackice_traffic.desktop
+
