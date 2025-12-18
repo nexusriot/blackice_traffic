@@ -28,7 +28,7 @@ WARNING: this __not__ a hack tool, just a educational project made just 4fun
 
 ## Requirements
 
-- Linux
+- Linux/Windows*
 - Python 3.8+
 - PyQt5
 - psutil
@@ -87,6 +87,13 @@ Building linux binary (PyInstaller)
 Run build:
 ```
 ./build_linux_bin.sh
+```
+
+Building Windows binary (PyInstaller) 
+------------- 
+Run build:
+```
+./build_win.cmd
 ```
 
 ---
