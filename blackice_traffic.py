@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import csv
 import os
 import sys
 import math
@@ -12,16 +13,18 @@ import urllib.request
 import urllib.error
 import psutil
 import ipaddress
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt
 
 APP_NAME = "BLACK ICE"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 APP_BUILD = "alpha"
 
 
-# Map tab requires QtWebEngine (separate pkg)
+# Map tab requires QtWebEngine (separate pkg: PyQt6-WebEngine)
 try:
-    from PyQt5 import QtWebEngineWidgets
+    from PyQt6 import QtWebEngineWidgets
+    from PyQt6.QtWebEngineCore import QWebEnginePage  # noqa: F401
     HAVE_WEBENGINE = True
 except Exception:
     HAVE_WEBENGINE = False
@@ -83,7 +86,7 @@ class HackerFont:
     @staticmethod
     def mono(size=11, bold=False):
         f = QtGui.QFont("DejaVu Sans Mono", size)
-        f.setStyleHint(QtGui.QFont.Monospace)
+        f.setStyleHint(QtGui.QFont.StyleHint.Monospace)
         f.setBold(bold)
         return f
 
@@ -92,9 +95,9 @@ class ScanlinesOverlay(QtWidgets.QWidget):
     """Transparent scanlines + subtle flicker overlay."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._phase = 0.0
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -106,7 +109,7 @@ class ScanlinesOverlay(QtWidgets.QWidget):
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
         w, h = self.width(), self.height()
         # scanlines
@@ -135,9 +138,9 @@ class MatrixRain(QtWidgets.QWidget):
     """Simple matrix-rain background."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self.cols = []
         self.char_set = list("01abcdef#$%&*+<>/\\|[]{}()~")
@@ -174,7 +177,7 @@ class MatrixRain(QtWidgets.QWidget):
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         p.setFont(HackerFont.mono(10))
 
         # very subtle
@@ -186,7 +189,6 @@ class MatrixRain(QtWidgets.QWidget):
                 ch = random.choice(self.char_set)
                 yy = y - i * 14
                 if 0 <= yy <= self.height():
-                    # head brighter
                     if i == 0:
                         p.setPen(QtGui.QPen(PHOSPHOR))
                         p.setOpacity(0.30)
@@ -213,7 +215,7 @@ class Oscilloscope(QtWidgets.QWidget):
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         p.fillRect(self.rect(), BG)
 
         w, h = self.width(), self.height()
@@ -261,17 +263,33 @@ class TrafficPoller(QtCore.QThread):
     def __init__(self, interval=1.0, parent=None):
         super().__init__(parent)
         self.interval = interval
+        self._stop_evt = QtCore.QWaitCondition()
+        self._mtx = QtCore.QMutex()
         self._stop = False
         self._prev = None
 
     def stop(self):
+        self._mtx.lock()
         self._stop = True
+        self._stop_evt.wakeAll()
+        self._mtx.unlock()
+
+    def _sleep(self, secs: float) -> bool:
+        self._mtx.lock()
+        try:
+            if self._stop:
+                return True
+            self._stop_evt.wait(self._mtx, int(secs * 1000))
+            return self._stop
+        finally:
+            self._mtx.unlock()
 
     def run(self):
         self._prev = psutil.net_io_counters(pernic=True)
         prev_t = time.time()
         while not self._stop:
-            time.sleep(self.interval)
+            if self._sleep(self.interval):
+                break
             now = psutil.net_io_counters(pernic=True)
             now_t = time.time()
             dt = max(0.2, now_t - prev_t)
@@ -310,17 +328,30 @@ class ConnScanner(QtCore.QThread):
     def __init__(self, interval=3.0, parent=None):
         super().__init__(parent)
         self.interval = interval
+        self._stop_evt = QtCore.QWaitCondition()
+        self._mtx = QtCore.QMutex()
         self._stop = False
         self._seen: Dict[str, float] = {}
 
     def stop(self):
+        self._mtx.lock()
         self._stop = True
+        self._stop_evt.wakeAll()
+        self._mtx.unlock()
+
+    def _sleep(self, secs: float) -> bool:
+        self._mtx.lock()
+        try:
+            if self._stop:
+                return True
+            self._stop_evt.wait(self._mtx, int(secs * 1000))
+            return self._stop
+        finally:
+            self._mtx.unlock()
 
     def _normalize_ip(self, ip: str) -> str:
-        # Normalize IPv4-mapped IPv6 like ::ffff:127.0.0.1 → 127.0.0.1
         if ip.startswith("::ffff:"):
             v4 = ip.split("::ffff:", 1)[1]
-            # Sometimes it can be hex-ish, but psutil normally gives dotted quad.
             return v4
         return ip
 
@@ -335,14 +366,12 @@ class ConnScanner(QtCore.QThread):
                     or addr.is_reserved
             )
         except Exception:
-            return True  # if we can't parse, treat as non-public
+            return True
 
     def _geo_lookup(self, ip: str) -> Tuple[Optional[float], Optional[float], str]:
         ip = self._normalize_ip(ip)
 
-        # Classify local/private early
         if self._is_privateish(ip):
-            # Better label than "GeoIP unavailable"
             try:
                 addr = ipaddress.ip_address(ip)
                 if addr.is_loopback:
@@ -355,7 +384,6 @@ class ConnScanner(QtCore.QThread):
                 pass
             return None, None, "LOCAL / NON-PUBLIC"
 
-        # Offline GeoIP if available
         global _geoip_reader
         if HAVE_GEOIP and _geoip_reader is not None:
             try:
@@ -370,11 +398,9 @@ class ConnScanner(QtCore.QThread):
                 lat = r.location.latitude
                 lon = r.location.longitude
 
-                # Build best-effort label
                 parts = [p for p in [city, region, country] if p]
                 label = " ".join(parts) if parts else (country or "Unknown")
 
-                # Some records have no coords
                 if lat is None or lon is None:
                     return None, None, label
 
@@ -400,10 +426,8 @@ class ConnScanner(QtCore.QThread):
             port = int(c.raddr.port)
             proto = "tcp" if c.type == socket.SOCK_STREAM else "udp"
             key = f"{proto}:{ip}:{port}"
-            # only public-ish (still allow private if you want; skip localhost)
             if ip.startswith("127.") or ip == "::1":
                 continue
-            # rate-limit duplicates
             if key in self._seen and (now - self._seen[key]) < 20:
                 continue
             self._seen[key] = now
@@ -422,7 +446,8 @@ class ConnScanner(QtCore.QThread):
             if pts:
                 self.points.emit([p.__dict__ for p in pts])
                 self.event.emit(f"[+] contacts detected: {len(pts)}")
-            time.sleep(self.interval)
+            if self._sleep(self.interval):
+                break
 
 
 class ConsoleLog(QtWidgets.QPlainTextEdit):
@@ -430,7 +455,7 @@ class ConsoleLog(QtWidgets.QPlainTextEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setMaximumBlockCount(5000)
-        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.setFont(HackerFont.mono(10))
         self.setStyleSheet(
             "QPlainTextEdit { background: #050a06; color: #00ff66; selection-background-color: #0b2a12; }"
@@ -441,13 +466,25 @@ class ConsoleLog(QtWidgets.QPlainTextEdit):
         self.appendPlainText(f"{ts} {msg}")
 
 
+def _hacker_button(text: str) -> QtWidgets.QPushButton:
+    b = QtWidgets.QPushButton(text)
+    b.setFont(HackerFont.mono(10))
+    b.setStyleSheet(
+        "QPushButton { background:#07100a; color:#00ff66; border:1px solid #0b2a12; padding:6px 10px; }"
+        "QPushButton:hover { border:1px solid #00ff66; }"
+    )
+    return b
+
+
 class BlackIceDashboard(QtWidgets.QWidget):
+    snapshotRequested = QtCore.pyqtSignal()
+
     def __init__(self):
         super().__init__()
 
         self.setAutoFillBackground(True)
         pal = self.palette()
-        pal.setColor(QtGui.QPalette.Window, BG)
+        pal.setColor(QtGui.QPalette.ColorRole.Window, BG)
         self.setPalette(pal)
 
         self.matrix = MatrixRain(self)
@@ -484,6 +521,9 @@ class BlackIceDashboard(QtWidgets.QWidget):
         self.totals_lbl.setFont(HackerFont.mono(10))
         self.totals_lbl.setStyleSheet("color: #00aa44;")
 
+        self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
+        self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
+
         self.log = ConsoleLog()
 
         top = QtWidgets.QHBoxLayout()
@@ -491,11 +531,13 @@ class BlackIceDashboard(QtWidgets.QWidget):
         top.addSpacing(12)
         top.addWidget(self.version)
         top.addStretch(1)
-        top.addWidget(QtWidgets.QLabel("INTERFACE:"))
-        lbl = top.itemAt(top.count()-1).widget()
-        lbl.setFont(HackerFont.mono(10))
-        lbl.setStyleSheet("color:#00aa44;")
+        iface_lbl = QtWidgets.QLabel("INTERFACE:")
+        iface_lbl.setFont(HackerFont.mono(10))
+        iface_lbl.setStyleSheet("color:#00aa44;")
+        top.addWidget(iface_lbl)
         top.addWidget(self.iface)
+        top.addSpacing(12)
+        top.addWidget(self.snapshot_btn)
 
         meters = QtWidgets.QHBoxLayout()
         meters.addWidget(self.rx_lbl)
@@ -511,10 +553,10 @@ class BlackIceDashboard(QtWidgets.QWidget):
         layout.addSpacing(6)
         layout.addLayout(meters)
         layout.addWidget(self.scope, 1)
-        layout.addWidget(QtWidgets.QLabel("EVENT LOG:"))
-        el = layout.itemAt(layout.count()-1).widget()
-        el.setFont(HackerFont.mono(10))
-        el.setStyleSheet("color:#00aa44;")
+        ev_lbl = QtWidgets.QLabel("EVENT LOG:")
+        ev_lbl.setFont(HackerFont.mono(10))
+        ev_lbl.setStyleSheet("color:#00aa44;")
+        layout.addWidget(ev_lbl)
         layout.addWidget(self.log, 1)
 
         self._last_snap = {}
@@ -544,7 +586,6 @@ class BlackIceDashboard(QtWidgets.QWidget):
             self.scope.push(rx, tx)
             self.rx_lbl.setText(f"RX: {human_bps(rx)}")
             self.tx_lbl.setText(f"TX: {human_bps(tx)}")
-            # totals (sum totals from all)
             rx_total = sum(v.get("rx_total", 0) for k, v in snap.items() if k != "_totals")
             tx_total = sum(v.get("tx_total", 0) for k, v in snap.items() if k != "_totals")
             self.totals_lbl.setText(f"TOTALS: RX {human_bytes(rx_total)}  |  TX {human_bytes(tx_total)}")
@@ -589,23 +630,18 @@ LEAFLET_HTML = r"""
 
   const markers = new Map();
 
-  // "Me" marker + rays
-  let me = null;            // {lat, lon, label}
+  let me = null;
   let meMarker = null;
   let rayLayer = L.layerGroup().addTo(map);
 
   function setMyLocation(obj) {
-    // obj: {lat, lon, label}
     if (!obj || obj.lat == null || obj.lon == null) return;
     me = { lat: obj.lat, lon: obj.lon, label: obj.label || "ME" };
 
     if (!meMarker) {
       meMarker = L.circleMarker([me.lat, me.lon], {
-        radius: 8,
-        weight: 2,
-        color: "#ff9900",
-        fillColor: "#ff9900",
-        fillOpacity: 0.35
+        radius: 8, weight: 2, color: "#ff9900",
+        fillColor: "#ff9900", fillOpacity: 0.35
       }).addTo(map);
       meMarker.bindPopup(me.label);
     } else {
@@ -614,24 +650,16 @@ LEAFLET_HTML = r"""
     }
   }
 
-  function clearRays() {
-    rayLayer.clearLayers();
-  }
+  function clearRays() { rayLayer.clearLayers(); }
 
   function redrawRays() {
     clearRays();
     if (!me) return;
-
-    // draw rays to every marker we have
     for (const [key, m] of markers.entries()) {
       const ll = m.getLatLng();
-      // ignore unknowns (0,0) if they slip in
       if (Math.abs(ll.lat) < 1e-6 && Math.abs(ll.lng) < 1e-6) continue;
-
       const line = L.polyline([[me.lat, me.lon], [ll.lat, ll.lng]], {
-        color: "#ff9900",
-        weight: 1.6,
-        opacity: 0.55
+        color: "#ff9900", weight: 1.6, opacity: 0.55
       });
       line.addTo(rayLayer);
     }
@@ -650,11 +678,8 @@ LEAFLET_HTML = r"""
         m.setPopupContent(label);
       } else {
         const m = L.circleMarker([lat, lon], {
-          radius: 6,
-          weight: 2,
-          color: "#00ff66",
-          fillColor: "#00ff66",
-          fillOpacity: 0.25
+          radius: 6, weight: 2, color: "#00ff66",
+          fillColor: "#00ff66", fillOpacity: 0.25
         }).addTo(map);
         m.bindPopup(label);
         markers.set(key, m);
@@ -671,12 +696,14 @@ LEAFLET_HTML = r"""
 
 
 class MapTab(QtWidgets.QWidget):
+    snapshotRequested = QtCore.pyqtSignal()
+
     def __init__(self):
         super().__init__()
 
         self.setAutoFillBackground(True)
         pal = self.palette()
-        pal.setColor(QtGui.QPalette.Window, BG)
+        pal.setColor(QtGui.QPalette.ColorRole.Window, BG)
         self.setPalette(pal)
 
         self.title = QtWidgets.QLabel("NET TRACE MAP — REMOTE CONTACTS")
@@ -694,9 +721,9 @@ class MapTab(QtWidgets.QWidget):
             self.web.setHtml(LEAFLET_HTML)
         else:
             self.web = QtWidgets.QLabel(
-                "QtWebEngine not installed.\n\nInstall PyQtWebEngine to enable the MAP tab."
+                "QtWebEngine not installed.\n\nInstall PyQt6-WebEngine to enable the MAP tab."
             )
-            self.web.setAlignment(QtCore.Qt.AlignCenter)
+            self.web.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.web.setFont(HackerFont.mono(11))
             self.web.setStyleSheet("color:#ffcc33; background:#07100a; border:1px solid #0b2a12; padding:20px;")
 
@@ -707,7 +734,7 @@ class MapTab(QtWidgets.QWidget):
             "QPlainTextEdit { background:#07100a; color:#00ff66; border:1px solid #0b2a12; }"
         )
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.web)
         split.addWidget(self.list)
         split.setSizes([700, 300])
@@ -730,7 +757,7 @@ class MapTab(QtWidgets.QWidget):
 
         self.me_enable = QtWidgets.QCheckBox("Show my location + rays")
         self.me_enable.setFont(HackerFont.mono(10))
-        self.me_enable.setStyleSheet("color:#ffcc33;")  # readable on dark
+        self.me_enable.setStyleSheet("color:#ffcc33;")
 
         self.me_refresh = QtWidgets.QPushButton("Locate me now")
         self.me_refresh.setFont(HackerFont.mono(10))
@@ -739,23 +766,25 @@ class MapTab(QtWidgets.QWidget):
             "QPushButton:hover { border:1px solid #ff9900; }"
         )
 
+        self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
+        self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
+
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.me_enable)
         row.addWidget(self.me_refresh)
         row.addStretch(1)
+        row.addWidget(self.snapshot_btn)
 
-        # Insert into layout, e.g. after hint:
         layout.addLayout(row)
         self.me_enable.toggled.connect(self._on_me_toggled)
         self.me_refresh.clicked.connect(self.locate_me)
-        self._me_obj = None  # cache {lat, lon, label}
+        self._me_obj = None
 
     def _js(self, code: str):
         if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
             self.web.page().runJavaScript(code)
 
     def _get_public_ip(self) -> Optional[str]:
-        # Try a couple providers (plain text)
         urls = [
             "https://ifconfig.co/ip",
             "https://api.ipify.org",
@@ -773,7 +802,6 @@ class MapTab(QtWidgets.QWidget):
         return None
 
     def _geo_online_ipapi(self) -> Tuple[Optional[float], Optional[float], str]:
-        # Online fallback: ipapi.co/json
         try:
             req = urllib.request.Request(
                 "https://ipapi.co/json/",
@@ -793,16 +821,9 @@ class MapTab(QtWidgets.QWidget):
             return None, None, "ME"
 
     def locate_me(self):
-        """
-        Resolve "my location".
-        Priority:
-          - Existing GeoLite2-City mmdb via geoip2 (offline) using public IP
-          - Online ipapi.co/json fallback
-        """
         lat = lon = None
         label = "ME"
 
-        # If offline GeoIP is available, use public IP + mmdb
         if HAVE_GEOIP and _geoip_reader is not None:
             ip = self._get_public_ip()
             if ip:
@@ -814,12 +835,11 @@ class MapTab(QtWidgets.QWidget):
                     cc = (r.country.iso_code or "").strip()
                     label = " ".join([p for p in [city, cc] if p]) or (cc or "ME")
                     if lat is not None and lon is not None:
-                        lat = float(lat);
+                        lat = float(lat)
                         lon = float(lon)
                 except Exception:
                     lat = lon = None
 
-        # Online fallback if still unknown
         if lat is None or lon is None:
             lat, lon, label2 = self._geo_online_ipapi()
             label = label2 or label
@@ -832,17 +852,14 @@ class MapTab(QtWidgets.QWidget):
         self._me_obj = {"lat": lat, "lon": lon, "label": f"ME — {label}"}
         self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  [*] ME located: {label} @ ({lat:.3f},{lon:.3f})")
 
-        # Push into map immediately if enabled
         if self.me_enable.isChecked():
             payload = json.dumps(self._me_obj)
             self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
 
     def _on_me_toggled(self, enabled: bool):
         if not enabled:
-            # just clear rays; keep markers
             self._js("window.BLACKICE && window.BLACKICE.clearRays();")
             return
-        # enabled
         if self._me_obj is None:
             self.locate_me()
         else:
@@ -850,7 +867,6 @@ class MapTab(QtWidgets.QWidget):
             self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
 
     def push_points(self, points: List[dict]):
-        # right-side list
         lines = []
         for p in points:
             lines.append(
@@ -873,9 +889,158 @@ class MapTab(QtWidgets.QWidget):
                 js = f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});"
                 self.web.page().runJavaScript(js)
 
-            # ensure rays follow updates (only if ME enabled & set)
             if self.me_enable.isChecked() and self._me_obj is not None:
                 self._js("window.BLACKICE && window.BLACKICE.redrawRays();")
+
+
+class ConnectionsTab(QtWidgets.QWidget):
+    """Sortable, filterable live table of remote contacts."""
+
+    COLS = ["First Seen", "Last Seen", "Proto", "IP", "Port", "Location", "Hits"]
+
+    snapshotRequested = QtCore.pyqtSignal()
+    csvExportRequested = QtCore.pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(QtGui.QPalette.ColorRole.Window, BG)
+        self.setPalette(pal)
+
+        self.title = QtWidgets.QLabel("CONTACT TABLE — AGGREGATED REMOTE ENDPOINTS")
+        self.title.setFont(HackerFont.mono(14, bold=True))
+        self.title.setStyleSheet("color:#00ff66;")
+
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setPlaceholderText("filter: ip / port / proto / location ...")
+        self.filter_edit.setFont(HackerFont.mono(10))
+        self.filter_edit.setStyleSheet(
+            "QLineEdit { background:#07100a; color:#00ff66; border:1px solid #0b2a12; padding:4px; }"
+        )
+
+        self.count_lbl = QtWidgets.QLabel("0 contacts")
+        self.count_lbl.setFont(HackerFont.mono(10))
+        self.count_lbl.setStyleSheet("color:#00aa44;")
+
+        self.clear_btn = _hacker_button("⌫ CLEAR")
+        self.export_btn = _hacker_button("⤓ EXPORT CSV")
+        self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
+        self.clear_btn.clicked.connect(self._clear)
+        self.export_btn.clicked.connect(self.csvExportRequested.emit)
+        self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
+
+        self.model = QtGui.QStandardItemModel(0, len(self.COLS), self)
+        self.model.setHorizontalHeaderLabels(self.COLS)
+
+        self.proxy = QtCore.QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(-1)  # all columns
+        self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
+
+        self.view = QtWidgets.QTableView()
+        self.view.setModel(self.proxy)
+        self.view.setSortingEnabled(True)
+        self.view.setAlternatingRowColors(True)
+        self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.verticalHeader().setVisible(False)
+        self.view.horizontalHeader().setStretchLastSection(True)
+        self.view.setFont(HackerFont.mono(10))
+        self.view.setStyleSheet(
+            "QTableView { background:#050a06; alternate-background-color:#07100a;"
+            " color:#00ff66; gridline-color:#0b2a12; selection-background-color:#0b2a12;"
+            " selection-color:#00ff66; border:1px solid #0b2a12; }"
+            "QHeaderView::section { background:#07100a; color:#00aa44; border:1px solid #0b2a12; padding:4px; }"
+        )
+        self.view.sortByColumn(1, Qt.SortOrder.DescendingOrder)  # Last Seen desc
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self.filter_edit, 1)
+        controls.addWidget(self.count_lbl)
+        controls.addSpacing(8)
+        controls.addWidget(self.clear_btn)
+        controls.addWidget(self.export_btn)
+        controls.addWidget(self.snapshot_btn)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addWidget(self.title)
+        layout.addLayout(controls)
+        layout.addWidget(self.view, 1)
+
+        # key -> row index in source model
+        self._rows: Dict[str, int] = {}
+
+    def _clear(self):
+        self.model.removeRows(0, self.model.rowCount())
+        self._rows.clear()
+        self.count_lbl.setText("0 contacts")
+
+    def _make_item(self, text: str, sort_value=None) -> QtGui.QStandardItem:
+        it = QtGui.QStandardItem(text)
+        it.setEditable(False)
+        if sort_value is not None:
+            it.setData(sort_value, Qt.ItemDataRole.UserRole)
+        return it
+
+    def add_points(self, points: List[dict]):
+        for p in points:
+            proto = p.get("proto", "?")
+            ip = p.get("ip", "?")
+            port = int(p.get("port", 0))
+            label = p.get("label", "")
+            location = label.split("—", 1)[1].strip() if "—" in label else label
+            ts = float(p.get("ts", time.time()))
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            key = f"{proto}:{ip}:{port}"
+
+            if key in self._rows:
+                src_row = self._rows[key]
+                last_item = self.model.item(src_row, 1)
+                hits_item = self.model.item(src_row, 6)
+                last_item.setText(ts_str)
+                last_item.setData(ts, Qt.ItemDataRole.UserRole)
+                try:
+                    hits = int(hits_item.text()) + 1
+                except Exception:
+                    hits = 2
+                hits_item.setText(str(hits))
+                hits_item.setData(hits, Qt.ItemDataRole.UserRole)
+                # Color hot remote countries / unusual ports? keep simple — just refresh location
+                self.model.item(src_row, 5).setText(location)
+                continue
+
+            row = [
+                self._make_item(ts_str, ts),
+                self._make_item(ts_str, ts),
+                self._make_item(proto.upper()),
+                self._make_item(ip),
+                self._make_item(str(port), port),
+                self._make_item(location),
+                self._make_item("1", 1),
+            ]
+            color = QtGui.QBrush(PHOSPHOR)
+            if location.startswith("LOCAL"):
+                color = QtGui.QBrush(PHOSPHOR_DIM)
+            elif "unavailable" in location.lower():
+                color = QtGui.QBrush(AMBER)
+            for it in row:
+                it.setForeground(color)
+            self.model.appendRow(row)
+            self._rows[key] = self.model.rowCount() - 1
+
+        self.count_lbl.setText(f"{self.model.rowCount()} contacts")
+
+    def export_csv(self, path: str):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.COLS)
+            for r in range(self.model.rowCount()):
+                w.writerow([self.model.item(r, c).text() for c in range(self.model.columnCount())])
+
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -884,7 +1049,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} ({APP_BUILD}) — Traffic Visualizer")
         self.resize(1200, 780)
 
-        # global stylesheet
         self.setStyleSheet("""
             QMainWindow { background: #050a06; }
             QTabWidget::pane { border: 1px solid #0b2a12; }
@@ -900,12 +1064,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.dash = BlackIceDashboard()
+        self.conns = ConnectionsTab()
         self.map = MapTab()
 
         self.tabs.addTab(self.dash, "BLACK ICE")
+        self.tabs.addTab(self.conns, "CONTACTS")
         self.tabs.addTab(self.map, "MAP")
 
-        # pollers
+        # snapshot wiring
+        self.dash.snapshotRequested.connect(lambda: self._snapshot(self.dash, "blackice_dashboard"))
+        self.conns.snapshotRequested.connect(lambda: self._snapshot(self.conns, "blackice_contacts"))
+        self.map.snapshotRequested.connect(lambda: self._snapshot(self.map, "blackice_map"))
+        self.conns.csvExportRequested.connect(self._export_csv)
+
         self.poller = TrafficPoller(interval=1.0)
         self.poller.traffic.connect(self._on_traffic)
         self.poller.start()
@@ -918,15 +1089,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dash.set_event("[*] boot sequence complete")
         self.dash.set_event("[*] traffic sensors online")
         self.dash.set_event("[*] net trace scanner armed")
-        self.dash.set_event(f"[*] {APP_NAME} v{APP_VERSION} ({APP_BUILD}) initialized")
+        self.dash.set_event(f"[*] {APP_NAME} v{APP_VERSION} ({APP_BUILD}) initialized (PyQt6)")
 
-        # small UI timer to keep interface list fresh
         self._ui_timer = QtCore.QTimer(self)
         self._ui_timer.timeout.connect(self._ui_tick)
         self._ui_timer.start(5000)
 
     def _ui_tick(self):
-        # refresh interfaces (hotplug, etc.)
         try:
             current = self.dash.iface.currentText()
             self.dash._populate_ifaces()
@@ -941,6 +1110,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_points(self, points: list):
         self.map.push_points(points)
+        self.conns.add_points(points)
+
+    def _snapshot(self, widget: QtWidgets.QWidget, stem: str):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        default = os.path.join(
+            os.path.expanduser("~"), f"{stem}_{ts}.png"
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Snapshot", default, "PNG Image (*.png)"
+        )
+        if not path:
+            return
+        pix = widget.grab()
+        ok = pix.save(path, "PNG")
+        if ok:
+            self.dash.set_event(f"[*] snapshot saved → {path}")
+        else:
+            self.dash.set_event(f"[!] snapshot FAILED → {path}")
+
+    def _export_csv(self):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        default = os.path.join(os.path.expanduser("~"), f"blackice_contacts_{ts}.csv")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Contacts CSV", default, "CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            self.conns.export_csv(path)
+            self.dash.set_event(f"[*] contacts CSV exported → {path}")
+        except Exception as e:
+            self.dash.set_event(f"[!] CSV export failed: {e}")
 
     def closeEvent(self, e):
         try:
@@ -981,7 +1182,7 @@ def main():
     app.setFont(HackerFont.mono(10))
     w = MainWindow()
     w.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # BLACK ICE - Traffic Visualizer
 
-Minimal hacker‑style network traffic visualizer for Linux, built with **Python + PyQt5**.
+Minimal hacker‑style network traffic visualizer for Linux, built with **Python + PyQt6**.
 
 Green‑phosphor UI, scanlines, matrix rain, live bandwidth waveform, and a world map
 showing your remote connections — with optional **"my location"** marker and rays.
@@ -19,9 +19,11 @@ WARNING: this __not__ a hack tool, just a educational project made just 4fun
 - Old‑school **BLACK ICE / cyberpunk** interface  :) 
 - Live RX/TX bandwidth (per interface or total)  
 - Event console (connections discovered in real time)  
+- **CONTACTS tab** — sortable/filterable table of remote endpoints (with CSV export)
 - World map (Leaflet via QtWebEngine)  
 - Optional **My Location** marker
 - **Rays** from you to remote contacts  
+- **Snapshot button** on every tab — save the current view as PNG
 - Offline GeoIP support (MaxMind GeoLite2)  
 - No packet sniffing by default (psutil‑based, safe mode)
 ---
@@ -29,10 +31,10 @@ WARNING: this __not__ a hack tool, just a educational project made just 4fun
 ## Requirements
 
 - Linux/Windows*
-- Python 3.8+
-- PyQt5
+- Python 3.9+
+- PyQt6
 - psutil
-- PyQtWebEngine (for MAP tab)
+- PyQt6-WebEngine (for MAP tab)
 
 Optional:
 - `geoip2` + `GeoLite2-City.mmdb` for offline geolocation
@@ -45,15 +47,9 @@ Optional:
 python3 -m venv .venv
 source .venv/bin/activate
 
-pip install PyQt5 psutil PyQtWebEngine
+pip install PyQt6 psutil PyQt6-WebEngine
 # optional offline GeoIP
 pip install geoip2
-```
-
-If QtWebEngine is missing via pip:
-
-```bash
-sudo apt install python3-pyqt5.qtwebengine
 ```
 
 ---

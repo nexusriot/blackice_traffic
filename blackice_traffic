@@ -1,3 +1,0 @@
-#!/bin/env bash
-
-python3 /usr/lib/blackice_traffic/blackice_traffic.py

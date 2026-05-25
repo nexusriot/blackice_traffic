@@ -6,3 +6,4 @@ build/
 dist/
 GeoLite2-City.mmdb
 blackice_traffic.spec
+blackice_traffic
