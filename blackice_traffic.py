@@ -1162,12 +1162,19 @@ def init_geoip():
     if not HAVE_GEOIP:
         return
     db = os.environ.get("GEOIP_DB", "").strip()
+    candidates = []
+    if db:
+        candidates.append(db)
+    candidates += [
+        "./GeoLite2-City.mmdb",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "GeoLite2-City.mmdb"),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "GeoLite2-City.mmdb"),
+        "/usr/lib/blackice_traffic/GeoLite2-City.mmdb",
+        "/usr/share/blackice_traffic/GeoLite2-City.mmdb",
+        os.path.expanduser("~/.local/share/blackice_traffic/GeoLite2-City.mmdb"),
+    ]
+    db = next((p for p in candidates if p and os.path.exists(p)), None)
     if not db:
-        db = "./GeoLite2-City.mmdb"
-    if not os.path.exists(db):
-        db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "./GeoLite2-City.mmdb")
-    if not os.path.exists(db):
         return
     try:
         _geoip_reader = geoip2.database.Reader(db)
