@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import collections
 import csv
 import os
 import sys
@@ -17,11 +18,10 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
 APP_NAME = "BLACK ICE"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.6.1"
 APP_BUILD = "alpha"
 
 
-# Map tab requires QtWebEngine (separate pkg: PyQt6-WebEngine)
 try:
     from PyQt6 import QtWebEngineWidgets
     from PyQt6.QtWebEngineCore import QWebEnginePage  # noqa: F401
@@ -29,7 +29,6 @@ try:
 except Exception:
     HAVE_WEBENGINE = False
 
-# Optional offline GeoIP (MaxMind mmdb)
 HAVE_GEOIP = False
 _geoip_reader = None
 try:
@@ -37,6 +36,9 @@ try:
     HAVE_GEOIP = True
 except Exception:
     HAVE_GEOIP = False
+
+HAVE_ASN = False
+_asn_reader = None
 
 
 PHOSPHOR = QtGui.QColor("#00ff66")
@@ -71,6 +73,24 @@ def human_bytes(n: float) -> str:
     return f"{v:,.1f} EB"
 
 
+_PORT_SERVICES: Dict[int, str] = {
+    20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET",
+    25: "SMTP", 53: "DNS", 67: "DHCP", 68: "DHCP",
+    80: "HTTP", 110: "POP3", 119: "NNTP", 123: "NTP",
+    143: "IMAP", 161: "SNMP", 194: "IRC", 443: "HTTPS",
+    445: "SMB", 465: "SMTPS", 587: "SMTP-SUB", 636: "LDAPS",
+    993: "IMAPS", 995: "POP3S", 1194: "OPENVPN", 1433: "MSSQL",
+    1723: "PPTP", 3306: "MYSQL", 3389: "RDP", 5432: "PGSQL",
+    5900: "VNC", 6379: "REDIS", 6667: "IRC", 6881: "TORRENT",
+    8080: "HTTP-ALT", 8443: "HTTPS-ALT", 9200: "ELASTIC",
+    27017: "MONGODB", 51820: "WIREGUARD",
+}
+
+
+def port_service(port: int) -> str:
+    return _PORT_SERVICES.get(port, "")
+
+
 @dataclass
 class ConnPoint:
     ip: str
@@ -80,6 +100,8 @@ class ConnPoint:
     lon: float
     label: str
     ts: float
+    process: str = ""
+    asn: str = ""
 
 
 class HackerFont:
@@ -112,7 +134,6 @@ class ScanlinesOverlay(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
         w, h = self.width(), self.height()
-        # scanlines
         p.setOpacity(0.18)
         pen = QtGui.QPen(QtGui.QColor(0, 0, 0, 255))
         for y in range(0, h, 3):
@@ -122,14 +143,12 @@ class ScanlinesOverlay(QtWidgets.QWidget):
             p.setPen(pen)
             p.drawLine(0, y, w, y)
 
-        # vignette
         p.setOpacity(0.25)
         grad = QtGui.QRadialGradient(w * 0.5, h * 0.5, max(w, h) * 0.75)
         grad.setColorAt(0.0, QtGui.QColor(0, 0, 0, 0))
         grad.setColorAt(1.0, QtGui.QColor(0, 0, 0, 220))
         p.fillRect(self.rect(), grad)
 
-        # flicker
         p.setOpacity(0.04 + random.random() * 0.03)
         p.fillRect(self.rect(), QtGui.QColor(255, 255, 255, 255))
 
@@ -180,7 +199,6 @@ class MatrixRain(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         p.setFont(HackerFont.mono(10))
 
-        # very subtle
         p.setOpacity(0.20)
         for c in self.cols:
             x = c["x"]
@@ -220,14 +238,12 @@ class Oscilloscope(QtWidgets.QWidget):
 
         w, h = self.width(), self.height()
 
-        # grid
         p.setPen(QtGui.QPen(GRID, 1))
         for x in range(0, w, 40):
             p.drawLine(x, 0, x, h)
         for y in range(0, h, 20):
             p.drawLine(0, y, w, y)
 
-        # axes labels
         p.setFont(HackerFont.mono(9))
         p.setPen(QtGui.QPen(PHOSPHOR_DIM))
         p.drawText(10, 16, "BANDWIDTH WAVEFORM (RX/TX)")
@@ -241,20 +257,130 @@ class Oscilloscope(QtWidgets.QWidget):
                 pts.append(QtCore.QPointF(x, y))
             return QtGui.QPolygonF(pts)
 
-        # RX line
         p.setPen(QtGui.QPen(PHOSPHOR, 2))
         p.setOpacity(0.85)
         p.drawPolyline(poly(self._rx))
 
-        # TX line (amber)
         p.setPen(QtGui.QPen(AMBER, 2))
         p.setOpacity(0.75)
         p.drawPolyline(poly(self._tx))
 
-        # max scale
         p.setOpacity(1.0)
         p.setPen(QtGui.QPen(PHOSPHOR_DIM))
         p.drawText(w - 190, 16, f"scale max: {human_bps(self._max)}")
+
+
+class HistoryGraph(QtWidgets.QWidget):
+    """Rolling time-series graph for bandwidth history."""
+
+    WINDOWS = {"5 MIN": 300, "15 MIN": 900, "30 MIN": 1800}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(220)
+        self._window = 300
+        self._data: Dict[str, collections.deque] = {}
+        self._selected_iface = "ALL"
+
+    def set_window(self, seconds: int):
+        self._window = seconds
+        self.update()
+
+    def set_iface(self, iface: str):
+        self._selected_iface = iface
+        self.update()
+
+    def push(self, ts: float, snap: dict):
+        for iface, v in snap.items():
+            if not isinstance(v, dict) or "rx_bps" not in v:
+                continue
+            if iface not in self._data:
+                self._data[iface] = collections.deque(maxlen=1800)
+            self._data[iface].append((ts, v["rx_bps"], v["tx_bps"]))
+        self.update()
+
+    def _get_series(self) -> List[Tuple[float, float, float]]:
+        src_key = "_totals" if self._selected_iface == "ALL" else self._selected_iface
+        src = self._data.get(src_key, collections.deque())
+        cutoff = time.time() - self._window
+        return [(ts, rx, tx) for ts, rx, tx in src if ts >= cutoff]
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.fillRect(self.rect(), BG)
+
+        w, h = self.width(), self.height()
+        ML, MR, MT, MB = 90, 20, 24, 30
+        gw = w - ML - MR
+        gh = h - MT - MB
+
+        p.setPen(QtGui.QPen(GRID, 1))
+        p.setOpacity(1.0)
+        for i in range(5):
+            y = MT + int(i * gh / 4)
+            p.drawLine(ML, y, ML + gw, y)
+        for i in range(7):
+            x = ML + int(i * gw / 6)
+            p.drawLine(x, MT, x, MT + gh)
+
+        series = self._get_series()
+
+        p.setFont(HackerFont.mono(9))
+        p.setPen(QtGui.QPen(PHOSPHOR_DIM))
+        win_label = next((k for k, v in self.WINDOWS.items() if v == self._window), f"{self._window}s")
+        p.drawText(ML + 4, 16, f"BANDWIDTH HISTORY  /  WINDOW: {win_label}  /  IFACE: {self._selected_iface}")
+        p.setPen(QtGui.QPen(PHOSPHOR))
+        p.drawText(w - 120, 16, "▬ RX")
+        p.setPen(QtGui.QPen(AMBER))
+        p.drawText(w - 70, 16, "▬ TX")
+
+        if not series:
+            p.setPen(QtGui.QPen(PHOSPHOR_DIM))
+            p.setFont(HackerFont.mono(11))
+            p.drawText(ML + gw // 2 - 70, MT + gh // 2 + 6, "ACCUMULATING DATA...")
+            return
+
+        max_val = max(max(rx, tx) for _, rx, tx in series) * 1.1
+        max_val = max(1.0, max_val)
+
+        p.setFont(HackerFont.mono(8))
+        for i in range(5):
+            val = max_val * (4 - i) / 4
+            y = MT + int(i * gh / 4)
+            p.setPen(QtGui.QPen(PHOSPHOR_DIM))
+            p.drawText(2, y - 5, ML - 6, 14,
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       human_bps(val))
+
+        now_ts = time.time()
+        start_ts = now_ts - self._window
+        for i in range(7):
+            frac = i / 6.0
+            ts_lbl = start_ts + frac * self._window
+            x = ML + int(frac * gw)
+            lbl = time.strftime("%H:%M", time.localtime(ts_lbl))
+            p.setPen(QtGui.QPen(PHOSPHOR_DIM))
+            p.drawText(x - 20, MT + gh + 4, 40, MB - 4,
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, lbl)
+
+        def to_pt(ts, val):
+            xf = (ts - start_ts) / self._window if self._window else 0.5
+            yf = 1.0 - clamp(val / max_val, 0.0, 1.0)
+            return QtCore.QPointF(ML + xf * gw, MT + yf * gh)
+
+        if len(series) > 1:
+            rx_poly = QtGui.QPolygonF([to_pt(ts, rx) for ts, rx, _ in series])
+            p.setPen(QtGui.QPen(PHOSPHOR, 2))
+            p.setOpacity(0.85)
+            p.drawPolyline(rx_poly)
+
+            tx_poly = QtGui.QPolygonF([to_pt(ts, tx) for ts, _, tx in series])
+            p.setPen(QtGui.QPen(AMBER, 2))
+            p.setOpacity(0.75)
+            p.drawPolyline(tx_poly)
+
+        p.setOpacity(1.0)
 
 
 class TrafficPoller(QtCore.QThread):
@@ -410,6 +536,20 @@ class ConnScanner(QtCore.QThread):
 
         return None, None, "GeoIP unavailable"
 
+    def _asn_lookup(self, ip: str) -> str:
+        global _asn_reader
+        if not HAVE_ASN or _asn_reader is None:
+            return ""
+        try:
+            r = _asn_reader.asn(ip)
+            org = (r.autonomous_system_organization or "").strip()
+            asn_num = r.autonomous_system_number
+            if org and asn_num:
+                return f"AS{asn_num} {org}"
+            return org or (f"AS{asn_num}" if asn_num else "")
+        except Exception:
+            return ""
+
     def _scan_psutil(self) -> List[ConnPoint]:
         out: List[ConnPoint] = []
         try:
@@ -432,11 +572,20 @@ class ConnScanner(QtCore.QThread):
                 continue
             self._seen[key] = now
 
+            proc_name = ""
+            if c.pid:
+                try:
+                    proc_name = psutil.Process(c.pid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+
             norm_ip = self._normalize_ip(ip)
             lat, lon, where = self._geo_lookup(norm_ip)
+            asn = self._asn_lookup(norm_ip) if not self._is_privateish(norm_ip) else ""
             label = f"{norm_ip}:{port} ({proto}) — {where}"
             out.append(ConnPoint(ip=norm_ip, port=port, proto=proto,
-                                 lat=lat or 0.0, lon=lon or 0.0, label=label, ts=now))
+                                 lat=lat or 0.0, lon=lon or 0.0, label=label, ts=now,
+                                 process=proc_name, asn=asn))
 
         return out
 
@@ -896,7 +1045,7 @@ class MapTab(QtWidgets.QWidget):
 class ConnectionsTab(QtWidgets.QWidget):
     """Sortable, filterable live table of remote contacts."""
 
-    COLS = ["First Seen", "Last Seen", "Proto", "IP", "Port", "Location", "Hits"]
+    COLS = ["First Seen", "Last Seen", "Proto", "IP", "Port/Svc", "Location", "Process", "ASN/Org", "Hits"]
 
     snapshotRequested = QtCore.pyqtSignal()
     csvExportRequested = QtCore.pyqtSignal()
@@ -937,7 +1086,7 @@ class ConnectionsTab(QtWidgets.QWidget):
         self.proxy = QtCore.QSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(-1)  # all columns
+        self.proxy.setFilterKeyColumn(-1)
         self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
 
         self.view = QtWidgets.QTableView()
@@ -955,7 +1104,7 @@ class ConnectionsTab(QtWidgets.QWidget):
             " selection-color:#00ff66; border:1px solid #0b2a12; }"
             "QHeaderView::section { background:#07100a; color:#00aa44; border:1px solid #0b2a12; padding:4px; }"
         )
-        self.view.sortByColumn(1, Qt.SortOrder.DescendingOrder)  # Last Seen desc
+        self.view.sortByColumn(1, Qt.SortOrder.DescendingOrder)
 
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self.filter_edit, 1)
@@ -971,7 +1120,6 @@ class ConnectionsTab(QtWidgets.QWidget):
         layout.addLayout(controls)
         layout.addWidget(self.view, 1)
 
-        # key -> row index in source model
         self._rows: Dict[str, int] = {}
 
     def _clear(self):
@@ -996,21 +1144,27 @@ class ConnectionsTab(QtWidgets.QWidget):
             ts = float(p.get("ts", time.time()))
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
             key = f"{proto}:{ip}:{port}"
+            process = p.get("process", "")
+            asn = p.get("asn", "")
+            svc = port_service(port)
+            port_svc = f"{port} · {svc}" if svc else str(port)
 
             if key in self._rows:
                 src_row = self._rows[key]
-                last_item = self.model.item(src_row, 1)
-                hits_item = self.model.item(src_row, 6)
-                last_item.setText(ts_str)
-                last_item.setData(ts, Qt.ItemDataRole.UserRole)
+                self.model.item(src_row, 1).setText(ts_str)
+                self.model.item(src_row, 1).setData(ts, Qt.ItemDataRole.UserRole)
+                hits_item = self.model.item(src_row, 8)
                 try:
                     hits = int(hits_item.text()) + 1
                 except Exception:
                     hits = 2
                 hits_item.setText(str(hits))
                 hits_item.setData(hits, Qt.ItemDataRole.UserRole)
-                # Color hot remote countries / unusual ports? keep simple — just refresh location
                 self.model.item(src_row, 5).setText(location)
+                if process:
+                    self.model.item(src_row, 6).setText(process)
+                if asn:
+                    self.model.item(src_row, 7).setText(asn)
                 continue
 
             row = [
@@ -1018,8 +1172,10 @@ class ConnectionsTab(QtWidgets.QWidget):
                 self._make_item(ts_str, ts),
                 self._make_item(proto.upper()),
                 self._make_item(ip),
-                self._make_item(str(port), port),
+                self._make_item(port_svc, port),
                 self._make_item(location),
+                self._make_item(process),
+                self._make_item(asn),
                 self._make_item("1", 1),
             ]
             color = QtGui.QBrush(PHOSPHOR)
@@ -1041,6 +1197,107 @@ class ConnectionsTab(QtWidgets.QWidget):
             for r in range(self.model.rowCount()):
                 w.writerow([self.model.item(r, c).text() for c in range(self.model.columnCount())])
 
+
+class StatsTab(QtWidgets.QWidget):
+    """Bandwidth history analytics with configurable time window."""
+
+    snapshotRequested = QtCore.pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(QtGui.QPalette.ColorRole.Window, BG)
+        self.setPalette(pal)
+
+        self.title = QtWidgets.QLabel("BANDWIDTH HISTORY — TIME-SERIES ANALYTICS")
+        self.title.setFont(HackerFont.mono(14, bold=True))
+        self.title.setStyleSheet("color:#00ff66;")
+
+        self.graph = HistoryGraph()
+
+        self.iface_combo = QtWidgets.QComboBox()
+        self.iface_combo.setFont(HackerFont.mono(10))
+        self.iface_combo.setStyleSheet(
+            "QComboBox { background: #07100a; color:#00ff66; border: 1px solid #0b2a12; padding: 4px; }"
+            "QAbstractItemView { background: #07100a; color:#00ff66; selection-background-color:#0b2a12; }"
+        )
+        self.iface_combo.addItem("ALL")
+        for n in psutil.net_io_counters(pernic=True):
+            self.iface_combo.addItem(n)
+        self.iface_combo.currentTextChanged.connect(self.graph.set_iface)
+
+        self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
+        self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
+
+        self._win_group = QtWidgets.QButtonGroup(self)
+        win_row = QtWidgets.QHBoxLayout()
+        for lbl_text, secs in HistoryGraph.WINDOWS.items():
+            rb = QtWidgets.QRadioButton(lbl_text)
+            rb.setFont(HackerFont.mono(10))
+            rb.setStyleSheet(
+                "QRadioButton { color:#00aa44; }"
+                "QRadioButton::checked { color:#00ff66; }"
+            )
+            if lbl_text == "5 MIN":
+                rb.setChecked(True)
+            rb.toggled.connect(lambda checked, s=secs: checked and self.graph.set_window(s))
+            self._win_group.addButton(rb)
+            win_row.addWidget(rb)
+        win_row.addStretch(1)
+
+        self.rx_peak_lbl = QtWidgets.QLabel("RX PEAK: —")
+        self.rx_avg_lbl  = QtWidgets.QLabel("RX AVG:  —")
+        self.tx_peak_lbl = QtWidgets.QLabel("TX PEAK: —")
+        self.tx_avg_lbl  = QtWidgets.QLabel("TX AVG:  —")
+        for lbl in (self.rx_peak_lbl, self.rx_avg_lbl):
+            lbl.setFont(HackerFont.mono(11))
+            lbl.setStyleSheet("color:#00ff66;")
+        for lbl in (self.tx_peak_lbl, self.tx_avg_lbl):
+            lbl.setFont(HackerFont.mono(11))
+            lbl.setStyleSheet("color:#ffcc33;")
+
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.title)
+        top.addStretch(1)
+        iface_lbl = QtWidgets.QLabel("INTERFACE:")
+        iface_lbl.setFont(HackerFont.mono(10))
+        iface_lbl.setStyleSheet("color:#00aa44;")
+        top.addWidget(iface_lbl)
+        top.addWidget(self.iface_combo)
+        top.addSpacing(12)
+        top.addWidget(self.snapshot_btn)
+
+        stats_row = QtWidgets.QHBoxLayout()
+        stats_row.addWidget(self.rx_peak_lbl)
+        stats_row.addSpacing(20)
+        stats_row.addWidget(self.rx_avg_lbl)
+        stats_row.addSpacing(30)
+        stats_row.addWidget(self.tx_peak_lbl)
+        stats_row.addSpacing(20)
+        stats_row.addWidget(self.tx_avg_lbl)
+        stats_row.addStretch(1)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addLayout(top)
+        layout.addLayout(win_row)
+        layout.addWidget(self.graph, 1)
+        layout.addLayout(stats_row)
+
+    def push_traffic(self, snap: dict):
+        ts = time.time()
+        self.graph.push(ts, snap)
+        series = self.graph._get_series()
+        if series:
+            rx_vals = [rx for _, rx, _ in series]
+            tx_vals = [tx for _, _, tx in series]
+            n = len(rx_vals)
+            self.rx_peak_lbl.setText(f"RX PEAK: {human_bps(max(rx_vals))}")
+            self.tx_peak_lbl.setText(f"TX PEAK: {human_bps(max(tx_vals))}")
+            self.rx_avg_lbl.setText(f"RX AVG:  {human_bps(sum(rx_vals) / n)}")
+            self.tx_avg_lbl.setText(f"TX AVG:  {human_bps(sum(tx_vals) / n)}")
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1066,15 +1323,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dash = BlackIceDashboard()
         self.conns = ConnectionsTab()
         self.map = MapTab()
+        self.stats = StatsTab()
 
         self.tabs.addTab(self.dash, "BLACK ICE")
         self.tabs.addTab(self.conns, "CONTACTS")
         self.tabs.addTab(self.map, "MAP")
+        self.tabs.addTab(self.stats, "STATS")
 
-        # snapshot wiring
         self.dash.snapshotRequested.connect(lambda: self._snapshot(self.dash, "blackice_dashboard"))
         self.conns.snapshotRequested.connect(lambda: self._snapshot(self.conns, "blackice_contacts"))
         self.map.snapshotRequested.connect(lambda: self._snapshot(self.map, "blackice_map"))
+        self.stats.snapshotRequested.connect(lambda: self._snapshot(self.stats, "blackice_stats"))
         self.conns.csvExportRequested.connect(self._export_csv)
 
         self.poller = TrafficPoller(interval=1.0)
@@ -1107,6 +1366,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_traffic(self, snap: dict):
         self.dash.update_traffic(snap)
+        self.stats.push_traffic(snap)
 
     def _on_points(self, points: list):
         self.map.push_points(points)
@@ -1182,8 +1442,35 @@ def init_geoip():
         _geoip_reader = None
 
 
+def init_asn():
+    global _asn_reader, HAVE_ASN
+    if not HAVE_GEOIP:
+        return
+    db = os.environ.get("ASN_DB", "").strip()
+    candidates = []
+    if db:
+        candidates.append(db)
+    candidates += [
+        "./GeoLite2-ASN.mmdb",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "GeoLite2-ASN.mmdb"),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "GeoLite2-ASN.mmdb"),
+        "/usr/lib/blackice_traffic/GeoLite2-ASN.mmdb",
+        "/usr/share/blackice_traffic/GeoLite2-ASN.mmdb",
+        os.path.expanduser("~/.local/share/blackice_traffic/GeoLite2-ASN.mmdb"),
+    ]
+    db = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not db:
+        return
+    try:
+        _asn_reader = geoip2.database.Reader(db)
+        HAVE_ASN = True
+    except Exception:
+        _asn_reader = None
+
+
 def main():
     init_geoip()
+    init_asn()
 
     app = QtWidgets.QApplication(sys.argv)
     app.setFont(HackerFont.mono(10))
