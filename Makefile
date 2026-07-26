@@ -1,4 +1,4 @@
-VERSION := 0.3.0
+VERSION := $(shell sed -n 's/^APP_VERSION *= *"\(.*\)".*/\1/p' blackice_traffic.py)
 HOST_ARCH := $(shell dpkg --print-architecture 2>/dev/null || uname -m)
 
 .PHONY: all bin deb deb-amd64 deb-arm64 clean help

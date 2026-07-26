@@ -1,7 +1,12 @@
 Package: blackice-traffic
 Version: _version_
+Section: net
+Priority: optional
 Architecture: amd64
+Depends: libc6, libglib2.0-0, libnss3, libgl1
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
-Description:Simple Network Traffic Visualizer
 Installed-Size: 60054
-Depends: python3 (>=3.8), python3-psutil, python3-geoip2, python3-pyqt5, python3-pyqt5.qtwebengine
+Description: Simple Network Traffic Visualizer
+ Minimal hacker-style network traffic visualizer built with PyQt6.
+ Ships as a self-contained binary with Python, PyQt6 and all Python
+ dependencies bundled; only a few system shared libraries are required.

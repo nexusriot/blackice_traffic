@@ -17,11 +17,6 @@ import ipaddress
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
-APP_NAME = "BLACK ICE"
-APP_VERSION = "0.6.1"
-APP_BUILD = "alpha"
-
-
 try:
     from PyQt6 import QtWebEngineWidgets
     from PyQt6.QtWebEngineCore import QWebEnginePage  # noqa: F401
@@ -29,14 +24,17 @@ try:
 except Exception:
     HAVE_WEBENGINE = False
 
-HAVE_GEOIP = False
-_geoip_reader = None
 try:
     import geoip2.database
     HAVE_GEOIP = True
 except Exception:
     HAVE_GEOIP = False
 
+APP_NAME = "BLACK ICE"
+APP_VERSION = "0.6.1"
+APP_BUILD = "alpha"
+
+_geoip_reader = None
 HAVE_ASN = False
 _asn_reader = None
 
@@ -91,6 +89,26 @@ def port_service(port: int) -> str:
     return _PORT_SERVICES.get(port, "")
 
 
+def normalize_ip(ip: str) -> str:
+    if ip.startswith("::ffff:"):
+        return ip.split("::ffff:", 1)[1]
+    return ip
+
+
+def is_privateish(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+        )
+    except Exception:
+        return True
+
+
 @dataclass
 class ConnPoint:
     ip: str
@@ -113,17 +131,44 @@ class HackerFont:
         return f
 
 
-class ScanlinesOverlay(QtWidgets.QWidget):
-    """Transparent scanlines + subtle flicker overlay."""
+class AnimatedOverlay(QtWidgets.QWidget):
+    """Transparent overlay whose repaint timer only ticks while visible."""
+    interval_ms = 33
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._phase = 0.0
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(33)
+
+    def _tick(self):
+        raise NotImplementedError
+
+    def set_running(self, run: bool):
+        if run:
+            if self.isVisible() and not self._timer.isActive():
+                self._timer.start(self.interval_ms)
+        else:
+            self._timer.stop()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.set_running(True)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.set_running(False)
+
+
+class ScanlinesOverlay(AnimatedOverlay):
+    """Transparent scanlines + subtle flicker overlay."""
+    interval_ms = 33
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
 
     def _tick(self):
         self._phase += 0.10
@@ -153,19 +198,14 @@ class ScanlinesOverlay(QtWidgets.QWidget):
         p.fillRect(self.rect(), QtGui.QColor(255, 255, 255, 255))
 
 
-class MatrixRain(QtWidgets.QWidget):
+class MatrixRain(AnimatedOverlay):
     """Simple matrix-rain background."""
+    interval_ms = 50
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-
         self.cols = []
         self.char_set = list("01abcdef#$%&*+<>/\\|[]{}()~")
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(50)
 
     def resizeEvent(self, e):
         self._init_cols()
@@ -476,23 +516,10 @@ class ConnScanner(QtCore.QThread):
             self._mtx.unlock()
 
     def _normalize_ip(self, ip: str) -> str:
-        if ip.startswith("::ffff:"):
-            v4 = ip.split("::ffff:", 1)[1]
-            return v4
-        return ip
+        return normalize_ip(ip)
 
     def _is_privateish(self, ip: str) -> bool:
-        try:
-            addr = ipaddress.ip_address(ip)
-            return (
-                    addr.is_private
-                    or addr.is_loopback
-                    or addr.is_link_local
-                    or addr.is_multicast
-                    or addr.is_reserved
-            )
-        except Exception:
-            return True
+        return is_privateish(ip)
 
     def _geo_lookup(self, ip: str) -> Tuple[Optional[float], Optional[float], str]:
         ip = self._normalize_ip(ip)
@@ -722,6 +749,10 @@ class BlackIceDashboard(QtWidgets.QWidget):
         self.matrix.setGeometry(self.rect())
         self.scan.setGeometry(self.rect())
         super().resizeEvent(e)
+
+    def set_fx_running(self, run: bool):
+        self.matrix.set_running(run)
+        self.scan.set_running(run)
 
     def set_event(self, msg: str):
         self.log.push(msg)
@@ -1403,6 +1434,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.dash.set_event(f"[!] CSV export failed: {e}")
 
+    def changeEvent(self, e):
+        if e.type() == QtCore.QEvent.Type.WindowStateChange:
+            minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+            self.dash.set_fx_running(not minimized)
+        super().changeEvent(e)
+
     def closeEvent(self, e):
         try:
             self.poller.stop()
@@ -1415,6 +1452,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         super().closeEvent(e)
+
+
+def resource_path(*names: str) -> Optional[str]:
+    """Locate a bundled resource across dev, PyInstaller and installed layouts."""
+    bases = [
+        getattr(sys, "_MEIPASS", ""),
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(os.path.abspath(sys.executable)),
+        "/usr/lib/blackice_traffic",
+        "/usr/share/blackice_traffic",
+        os.path.expanduser("~/.local/share/blackice_traffic"),
+        os.getcwd(),
+    ]
+    for base in bases:
+        if not base:
+            continue
+        for name in names:
+            for cand in (os.path.join(base, name), os.path.join(base, "resources", name)):
+                if os.path.exists(cand):
+                    return cand
+    return None
 
 
 def init_geoip():
@@ -1473,8 +1531,19 @@ def main():
     init_asn()
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setDesktopFileName("blackice_traffic")
     app.setFont(HackerFont.mono(10))
+
+    icon_path = resource_path("icon.png", "icon.ico")
+    if icon_path:
+        app.setWindowIcon(QtGui.QIcon(icon_path))
+
     w = MainWindow()
+    if icon_path:
+        w.setWindowIcon(QtGui.QIcon(icon_path))
     w.show()
     sys.exit(app.exec())
 
