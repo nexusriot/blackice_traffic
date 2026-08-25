@@ -4,6 +4,7 @@ import csv
 import os
 import sys
 import math
+import threading
 import time
 import json
 import random
@@ -31,7 +32,7 @@ except Exception:
     HAVE_GEOIP = False
 
 APP_NAME = "BLACK ICE"
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.8.0"
 APP_BUILD = "alpha"
 
 _geoip_reader = None
@@ -109,6 +110,101 @@ def is_privateish(ip: str) -> bool:
         return True
 
 
+_LOOPBACK_NICS = {"lo", "lo0", "lo1", "loopback"}
+
+
+def is_loopback_nic(name: str) -> bool:
+    """True for loopback interfaces. Their traffic is counted on both RX and
+    TX of the same NIC, so including them in the aggregate double-counts
+    localhost bytes as if they were real network throughput."""
+    n = (name or "").strip().lower()
+    return n in _LOOPBACK_NICS or "loopback" in n
+
+
+def is_loopback_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        return False
+
+
+def ip_sort_key(ip: str) -> Tuple[int, int]:
+    """Sortable key for an IP column: IPv4 before IPv6, then numeric order.
+    Unparseable strings sort last."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        return (addr.version, int(addr))
+    except Exception:
+        return (99, 0)
+
+
+def get_public_ip() -> Optional[str]:
+    urls = [
+        "https://ifconfig.co/ip",
+        "https://api.ipify.org",
+    ]
+    headers = {"User-Agent": "blackice-defender/1.0"}
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                ip = r.read().decode("utf-8", "replace").strip()
+                ipaddress.ip_address(ip)  # reject error pages / garbage
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+def geo_online_ipapi() -> Tuple[Optional[float], Optional[float], str]:
+    try:
+        req = urllib.request.Request(
+            "https://ipapi.co/json/",
+            headers={"User-Agent": "blackice-defender/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+            lat = data.get("latitude")
+            lon = data.get("longitude")
+            city = (data.get("city") or "").strip()
+            country = (data.get("country_code") or "").strip()
+            label = " ".join([p for p in [city, country] if p]) or "ME"
+            if lat is None or lon is None:
+                return None, None, label
+            return float(lat), float(lon), label
+    except Exception:
+        return None, None, "ME"
+
+
+def resolve_my_location() -> Tuple[Optional[float], Optional[float], str]:
+    """Geolocate this host: offline GeoIP on the public IP first, then the
+    online ipapi fallback. Blocking (network) — run off the GUI thread."""
+    lat = lon = None
+    label = "ME"
+
+    if HAVE_GEOIP and _geoip_reader is not None:
+        ip = get_public_ip()
+        if ip:
+            try:
+                r = _geoip_reader.city(ip)
+                lat = r.location.latitude
+                lon = r.location.longitude
+                city = (r.city.name or "").strip()
+                cc = (r.country.iso_code or "").strip()
+                label = " ".join([p for p in [city, cc] if p]) or (cc or "ME")
+                if lat is not None and lon is not None:
+                    lat = float(lat)
+                    lon = float(lon)
+            except Exception:
+                lat = lon = None
+
+    if lat is None or lon is None:
+        lat, lon, label2 = geo_online_ipapi()
+        label = label2 or label
+
+    return lat, lon, label
+
+
 @dataclass
 class ConnPoint:
     ip: str
@@ -120,6 +216,77 @@ class ConnPoint:
     ts: float
     process: str = ""
     asn: str = ""
+
+
+CONFIG_ORG = "blackice"
+CONFIG_APP = "blackice_traffic"
+
+
+def app_settings() -> QtCore.QSettings:
+    """A predictable, hand-editable INI store (~/.config/blackice/blackice_traffic.ini)
+    that behaves the same for the source tree, the PyInstaller binary and the .deb."""
+    return QtCore.QSettings(
+        QtCore.QSettings.Format.IniFormat,
+        QtCore.QSettings.Scope.UserScope,
+        CONFIG_ORG,
+        CONFIG_APP,
+    )
+
+
+class AppConfig:
+    """Opt-in persistence of window geometry, layout and view state.
+
+    Only the enabled flag is always written; every other key is read and
+    written exclusively while saving is on, so switching it off leaves the app
+    starting from defaults again. Reads never raise: the INI is meant to be
+    hand-editable, and a mangled value must not stop the app from starting."""
+
+    KEY_ENABLED = "config/save_enabled"
+
+    def __init__(self, settings: Optional[QtCore.QSettings] = None):
+        self._s = settings if settings is not None else app_settings()
+        self._enabled = self._read(self.KEY_ENABLED, False, bool)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def path(self) -> str:
+        return self._s.fileName()
+
+    def _read(self, key: str, default, cast=None):
+        try:
+            if cast is not None:
+                return self._s.value(key, default, type=cast)
+            return self._s.value(key, default)
+        except (TypeError, ValueError):
+            return default
+
+    def set_enabled(self, on: bool):
+        self._enabled = bool(on)
+        self._s.setValue(self.KEY_ENABLED, self._enabled)
+        self._s.sync()
+
+    def get(self, key: str, default=None, cast=None):
+        if not self._enabled:
+            return default
+        return self._read(key, default, cast)
+
+    def set(self, key: str, value):
+        if not self._enabled:
+            return
+        self._s.setValue(key, value)
+
+    def clear_state(self):
+        """Forget every saved layout key, keeping the enabled flag itself."""
+        for key in self._s.allKeys():
+            if key != self.KEY_ENABLED:
+                self._s.remove(key)
+        self._s.sync()
+
+    def sync(self):
+        self._s.sync()
 
 
 class HackerFont:
@@ -208,6 +375,7 @@ class MatrixRain(AnimatedOverlay):
         self.char_set = list("01abcdef#$%&*+<>/\\|[]{}()~")
 
     def resizeEvent(self, e):
+        super().resizeEvent(e)
         self._init_cols()
 
     def _init_cols(self):
@@ -264,6 +432,14 @@ class Oscilloscope(QtWidgets.QWidget):
         self._rx = [0.0] * 240
         self._tx = [0.0] * 240
         self._max = 1.0
+
+    def reset(self):
+        """Drop the waveform history (e.g. after an interface switch, where
+        the retained samples belong to a different NIC)."""
+        self._rx = [0.0] * len(self._rx)
+        self._tx = [0.0] * len(self._tx)
+        self._max = 1.0
+        self.update()
 
     def push(self, rx_bps: float, tx_bps: float):
         self._rx.pop(0); self._rx.append(rx_bps)
@@ -337,6 +513,13 @@ class HistoryGraph(QtWidgets.QWidget):
             if iface not in self._data:
                 self._data[iface] = collections.deque(maxlen=1800)
             self._data[iface].append((ts, v["rx_bps"], v["tx_bps"]))
+
+        # Drop NICs that stopped reporting (transient docker/veth names) so
+        # _data does not keep a deque per name ever seen.
+        stale_before = ts - max(self.WINDOWS.values())
+        for gone in [k for k, d in self._data.items() if not d or d[-1][0] < stale_before]:
+            del self._data[gone]
+
         self.update()
 
     def _get_series(self) -> List[Tuple[float, float, float]]:
@@ -423,6 +606,35 @@ class HistoryGraph(QtWidgets.QWidget):
         p.setOpacity(1.0)
 
 
+def build_snapshot(prev: dict, now: dict, dt: float) -> dict:
+    """Per-NIC rates plus the aggregate under "_totals". Loopback NICs are
+    reported individually but kept out of the aggregate."""
+    snap: Dict[str, dict] = {}
+    total_rx_bps = 0.0
+    total_tx_bps = 0.0
+
+    for nic, cnt in now.items():
+        p = prev.get(nic)
+        if p is None:
+            continue
+        rx_bps = max(0.0, (cnt.bytes_recv - p.bytes_recv) * 8.0 / dt)
+        tx_bps = max(0.0, (cnt.bytes_sent - p.bytes_sent) * 8.0 / dt)
+        snap[nic] = {
+            "rx_bps": rx_bps,
+            "tx_bps": tx_bps,
+            "rx_total": cnt.bytes_recv,
+            "tx_total": cnt.bytes_sent,
+            "pkts_in": cnt.packets_recv,
+            "pkts_out": cnt.packets_sent,
+        }
+        if not is_loopback_nic(nic):
+            total_rx_bps += rx_bps
+            total_tx_bps += tx_bps
+
+    snap["_totals"] = {"rx_bps": total_rx_bps, "tx_bps": total_tx_bps}
+    return snap
+
+
 class TrafficPoller(QtCore.QThread):
     traffic = QtCore.pyqtSignal(dict)
 
@@ -460,28 +672,7 @@ class TrafficPoller(QtCore.QThread):
             now_t = time.time()
             dt = max(0.2, now_t - prev_t)
 
-            snap = {}
-            total_rx_bps = 0.0
-            total_tx_bps = 0.0
-
-            for nic, cnt in now.items():
-                if nic not in self._prev:
-                    continue
-                p = self._prev[nic]
-                rx_bps = (cnt.bytes_recv - p.bytes_recv) * 8.0 / dt
-                tx_bps = (cnt.bytes_sent - p.bytes_sent) * 8.0 / dt
-                snap[nic] = {
-                    "rx_bps": max(0.0, rx_bps),
-                    "tx_bps": max(0.0, tx_bps),
-                    "rx_total": cnt.bytes_recv,
-                    "tx_total": cnt.bytes_sent,
-                    "pkts_in": cnt.packets_recv,
-                    "pkts_out": cnt.packets_sent,
-                }
-                total_rx_bps += max(0.0, rx_bps)
-                total_tx_bps += max(0.0, tx_bps)
-
-            snap["_totals"] = {"rx_bps": total_rx_bps, "tx_bps": total_tx_bps}
+            snap = build_snapshot(self._prev, now, dt)
             self._prev = now
             prev_t = now_t
             self.traffic.emit(snap)
@@ -586,14 +777,19 @@ class ConnScanner(QtCore.QThread):
             return out
 
         now = time.time()
+        cutoff = now - 600
+        self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
         for c in conns:
             if not c.raddr:
                 continue
-            ip = c.raddr.ip
+            # Normalize first: an IPv4-mapped v6 socket and a plain v4
+            # socket to the same endpoint must share one dedupe key, and
+            # ::ffff:127.0.0.1 has to be filtered as loopback.
+            ip = self._normalize_ip(c.raddr.ip)
             port = int(c.raddr.port)
             proto = "tcp" if c.type == socket.SOCK_STREAM else "udp"
             key = f"{proto}:{ip}:{port}"
-            if ip.startswith("127.") or ip == "::1":
+            if is_loopback_ip(ip):
                 continue
             if key in self._seen and (now - self._seen[key]) < 20:
                 continue
@@ -606,11 +802,10 @@ class ConnScanner(QtCore.QThread):
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     pass
 
-            norm_ip = self._normalize_ip(ip)
-            lat, lon, where = self._geo_lookup(norm_ip)
-            asn = self._asn_lookup(norm_ip) if not self._is_privateish(norm_ip) else ""
-            label = f"{norm_ip}:{port} ({proto}) — {where}"
-            out.append(ConnPoint(ip=norm_ip, port=port, proto=proto,
+            lat, lon, where = self._geo_lookup(ip)
+            asn = self._asn_lookup(ip) if not self._is_privateish(ip) else ""
+            label = f"{ip}:{port} ({proto}) — {where}"
+            out.append(ConnPoint(ip=ip, port=port, proto=proto,
                                  lat=lat or 0.0, lon=lon or 0.0, label=label, ts=now,
                                  process=proc_name, asn=asn))
 
@@ -642,18 +837,21 @@ class ConsoleLog(QtWidgets.QPlainTextEdit):
         self.appendPlainText(f"{ts} {msg}")
 
 
-def _hacker_button(text: str) -> QtWidgets.QPushButton:
+def _hacker_button(text: str, checkable: bool = False) -> QtWidgets.QPushButton:
     b = QtWidgets.QPushButton(text)
     b.setFont(HackerFont.mono(10))
+    b.setCheckable(checkable)
     b.setStyleSheet(
         "QPushButton { background:#07100a; color:#00ff66; border:1px solid #0b2a12; padding:6px 10px; }"
         "QPushButton:hover { border:1px solid #00ff66; }"
+        "QPushButton:checked { background:#0b2a12; border:1px solid #00ff66; }"
     )
     return b
 
 
 class BlackIceDashboard(QtWidgets.QWidget):
     snapshotRequested = QtCore.pyqtSignal()
+    configToggled = QtCore.pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -700,6 +898,12 @@ class BlackIceDashboard(QtWidgets.QWidget):
         self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
         self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
 
+        self.config_btn = _hacker_button("▣ SAVE CONFIG", checkable=True)
+        self.config_btn.setToolTip(
+            "Remember window geometry, layout, selected tab and view state between runs"
+        )
+        self.config_btn.toggled.connect(self.configToggled.emit)
+
         self.log = ConsoleLog()
 
         top = QtWidgets.QHBoxLayout()
@@ -713,6 +917,7 @@ class BlackIceDashboard(QtWidgets.QWidget):
         top.addWidget(iface_lbl)
         top.addWidget(self.iface)
         top.addSpacing(12)
+        top.addWidget(self.config_btn)
         top.addWidget(self.snapshot_btn)
 
         meters = QtWidgets.QHBoxLayout()
@@ -737,6 +942,9 @@ class BlackIceDashboard(QtWidgets.QWidget):
 
         self._last_snap = {}
         self._populate_ifaces()
+        # A switch changes which NIC the waveform describes, so the retained
+        # samples (and the derived scale) must not carry over.
+        self.iface.currentTextChanged.connect(self._on_iface_changed)
 
     def _populate_ifaces(self):
         self.iface.clear()
@@ -744,6 +952,17 @@ class BlackIceDashboard(QtWidgets.QWidget):
         self.iface.addItem("ALL")
         for n in nics:
             self.iface.addItem(n)
+
+    def set_config_enabled(self, on: bool):
+        """Reflect the stored flag without re-emitting configToggled."""
+        self.config_btn.blockSignals(True)
+        self.config_btn.setChecked(bool(on))
+        self.config_btn.blockSignals(False)
+
+    def _on_iface_changed(self, _name: str):
+        self.scope.reset()
+        self.rx_lbl.setText("RX: 0 b/s")
+        self.tx_lbl.setText("TX: 0 b/s")
 
     def resizeEvent(self, e):
         self.matrix.setGeometry(self.rect())
@@ -766,13 +985,17 @@ class BlackIceDashboard(QtWidgets.QWidget):
             self.scope.push(rx, tx)
             self.rx_lbl.setText(f"RX: {human_bps(rx)}")
             self.tx_lbl.setText(f"TX: {human_bps(tx)}")
-            rx_total = sum(v.get("rx_total", 0) for k, v in snap.items() if k != "_totals")
-            tx_total = sum(v.get("tx_total", 0) for k, v in snap.items() if k != "_totals")
+            nics = [(k, v) for k, v in snap.items()
+                    if k != "_totals" and not is_loopback_nic(k)]
+            rx_total = sum(v.get("rx_total", 0) for _, v in nics)
+            tx_total = sum(v.get("tx_total", 0) for _, v in nics)
             self.totals_lbl.setText(f"TOTALS: RX {human_bytes(rx_total)}  |  TX {human_bytes(tx_total)}")
         else:
             v = snap.get(sel)
             if not v:
-                self._populate_ifaces()
+                # No counters for the selected NIC this tick (it just appeared
+                # or went away). Keep the user's selection — _ui_tick rebuilds
+                # the combo when the NIC set actually changes.
                 return
             rx = v["rx_bps"]; tx = v["tx_bps"]
             self.scope.push(rx, tx)
@@ -832,6 +1055,16 @@ LEAFLET_HTML = r"""
 
   function clearRays() { rayLayer.clearLayers(); }
 
+  function clearMe() {
+    if (meMarker) { map.removeLayer(meMarker); meMarker = null; }
+    me = null;
+    clearRays();
+  }
+
+  function focusMe(zoom) {
+    if (me) map.flyTo([me.lat, me.lon], zoom || 8);
+  }
+
   function redrawRays() {
     clearRays();
     if (!me) return;
@@ -868,15 +1101,23 @@ LEAFLET_HTML = r"""
     redrawRays();
   }
 
-  window.BLACKICE = { upsertPoints, setMyLocation, redrawRays, clearRays };
+  window.BLACKICE = { upsertPoints, setMyLocation, redrawRays, clearRays, clearMe, focusMe };
 </script>
 </body>
 </html>
 """
 
 
+class LocateBridge(QtCore.QObject):
+    """Marshals locate-worker results back onto the GUI thread."""
+    located = QtCore.pyqtSignal(float, float, str)
+    failed = QtCore.pyqtSignal(str)
+
+
 class MapTab(QtWidgets.QWidget):
     snapshotRequested = QtCore.pyqtSignal()
+
+    MAX_PENDING_JS = 64
 
     def __init__(self):
         super().__init__()
@@ -896,8 +1137,12 @@ class MapTab(QtWidgets.QWidget):
         self.hint.setFont(HackerFont.mono(9))
         self.hint.setStyleSheet("color:#00aa44;")
 
+        self._page_ready = False
+        self._pending_js: List[str] = []
+
         if HAVE_WEBENGINE:
             self.web = QtWebEngineWidgets.QWebEngineView()
+            self.web.loadFinished.connect(self._on_load_finished)
             self.web.setHtml(LEAFLET_HTML)
         else:
             self.web = QtWidgets.QLabel(
@@ -906,24 +1151,26 @@ class MapTab(QtWidgets.QWidget):
             self.web.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.web.setFont(HackerFont.mono(11))
             self.web.setStyleSheet("color:#ffcc33; background:#07100a; border:1px solid #0b2a12; padding:20px;")
+            self._page_ready = True  # nothing to wait for; _exec_js no-ops
 
         self.list = QtWidgets.QPlainTextEdit()
         self.list.setReadOnly(True)
+        self.list.setMaximumBlockCount(5000)
         self.list.setFont(HackerFont.mono(10))
         self.list.setStyleSheet(
             "QPlainTextEdit { background:#07100a; color:#00ff66; border:1px solid #0b2a12; }"
         )
 
-        split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.web)
-        split.addWidget(self.list)
-        split.setSizes([700, 300])
+        self.split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+        self.split.addWidget(self.web)
+        self.split.addWidget(self.list)
+        self.split.setSizes([700, 300])
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(self.title)
         layout.addWidget(self.hint)
-        layout.addWidget(split, 1)
+        layout.addWidget(self.split, 1)
 
         self.version = QtWidgets.QLabel(f"{APP_NAME} v{APP_VERSION}")
         self.version.setFont(HackerFont.mono(8))
@@ -940,11 +1187,14 @@ class MapTab(QtWidgets.QWidget):
         self.me_enable.setStyleSheet("color:#ffcc33;")
 
         self.me_refresh = QtWidgets.QPushButton("Locate me now")
-        self.me_refresh.setFont(HackerFont.mono(10))
-        self.me_refresh.setStyleSheet(
-            "QPushButton { background:#07100a; color:#ff9900; border:1px solid #0b2a12; padding:6px 10px; }"
-            "QPushButton:hover { border:1px solid #ff9900; }"
-        )
+        self.focus_btn = QtWidgets.QPushButton("⌖ MY LOCATION")
+        for b in (self.me_refresh, self.focus_btn):
+            b.setFont(HackerFont.mono(10))
+            b.setStyleSheet(
+                "QPushButton { background:#07100a; color:#ff9900; border:1px solid #0b2a12; padding:6px 10px; }"
+                "QPushButton:hover { border:1px solid #ff9900; }"
+                "QPushButton:disabled { color:#664400; }"
+            )
 
         self.snapshot_btn = _hacker_button("◉ SNAPSHOT")
         self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
@@ -952,99 +1202,111 @@ class MapTab(QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.me_enable)
         row.addWidget(self.me_refresh)
+        row.addWidget(self.focus_btn)
         row.addStretch(1)
         row.addWidget(self.snapshot_btn)
 
         layout.addLayout(row)
         self.me_enable.toggled.connect(self._on_me_toggled)
-        self.me_refresh.clicked.connect(self.locate_me)
+        self.me_refresh.clicked.connect(lambda: self.locate_me(focus=False))
+        self.focus_btn.clicked.connect(lambda: self.locate_me(focus=True))
         self._me_obj = None
+        self._locating = False
+        self._focus_pending = False
+        self._bridge = LocateBridge(self)
+        self._bridge.located.connect(self._on_located)
+        self._bridge.failed.connect(self._on_locate_failed)
 
-    def _js(self, code: str):
+    def _exec_js(self, code: str):
         if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
             self.web.page().runJavaScript(code)
 
-    def _get_public_ip(self) -> Optional[str]:
-        urls = [
-            "https://ifconfig.co/ip",
-            "https://api.ipify.org",
-        ]
-        headers = {"User-Agent": "blackice-defender/1.0"}
-        for u in urls:
-            try:
-                req = urllib.request.Request(u, headers=headers)
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    ip = r.read().decode("utf-8", "replace").strip()
-                    if ip:
-                        return ip
-            except Exception:
-                continue
-        return None
-
-    def _geo_online_ipapi(self) -> Tuple[Optional[float], Optional[float], str]:
-        try:
-            req = urllib.request.Request(
-                "https://ipapi.co/json/",
-                headers={"User-Agent": "blackice-defender/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=6) as r:
-                data = json.loads(r.read().decode("utf-8", "replace"))
-                lat = data.get("latitude")
-                lon = data.get("longitude")
-                city = (data.get("city") or "").strip()
-                country = (data.get("country_code") or "").strip()
-                label = " ".join([p for p in [city, country] if p]) or "ME"
-                if lat is None or lon is None:
-                    return None, None, label
-                return float(lat), float(lon), label
-        except Exception:
-            return None, None, "ME"
-
-    def locate_me(self):
-        lat = lon = None
-        label = "ME"
-
-        if HAVE_GEOIP and _geoip_reader is not None:
-            ip = self._get_public_ip()
-            if ip:
-                try:
-                    r = _geoip_reader.city(ip)
-                    lat = r.location.latitude
-                    lon = r.location.longitude
-                    city = (r.city.name or "").strip()
-                    cc = (r.country.iso_code or "").strip()
-                    label = " ".join([p for p in [city, cc] if p]) or (cc or "ME")
-                    if lat is not None and lon is not None:
-                        lat = float(lat)
-                        lon = float(lon)
-                except Exception:
-                    lat = lon = None
-
-        if lat is None or lon is None:
-            lat, lon, label2 = self._geo_online_ipapi()
-            label = label2 or label
-
-        if lat is None or lon is None:
-            self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  [!] failed to locate ME")
-            self._me_obj = None
+    def _js(self, code: str):
+        # setHtml() loads asynchronously and Leaflet itself is fetched over the
+        # network, so window.BLACKICE does not exist for the first seconds.
+        # Queue instead of letting the guard silently swallow the call.
+        if not self._page_ready:
+            self._pending_js.append(code)
+            del self._pending_js[:-self.MAX_PENDING_JS]
             return
+        self._exec_js(code)
+
+    def _on_load_finished(self, ok: bool):
+        if not ok:
+            self._pending_js.clear()
+            self._log("[!] map page failed to load")
+            return
+        self._page_ready = True
+        pending, self._pending_js = self._pending_js, []
+        for code in pending:
+            self._exec_js(code)
+
+    def _log(self, msg: str):
+        self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  {msg}")
+
+    def _push_me_marker(self):
+        payload = json.dumps(self._me_obj)
+        self._js(
+            "if (window.BLACKICE) { window.BLACKICE.setMyLocation(%s); window.BLACKICE.redrawRays(); }"
+            % payload
+        )
+
+    def locate_me(self, focus: bool = False):
+        """Kick off geolocation in the background; never blocks the GUI."""
+        if self._locating:
+            self._focus_pending = self._focus_pending or focus
+            return
+        self._locating = True
+        self._focus_pending = focus
+        self.me_refresh.setEnabled(False)
+        self.focus_btn.setEnabled(False)
+        self._log("[*] locating ME ...")
+        threading.Thread(target=self._locate_worker, daemon=True).start()
+
+    def _locate_worker(self):
+        try:
+            lat, lon, label = resolve_my_location()
+            if lat is None or lon is None:
+                self._bridge.failed.emit(label or "no result")
+            else:
+                self._bridge.located.emit(lat, lon, label)
+        except RuntimeError:
+            pass  # widget torn down while the lookup was in flight
+
+    def _on_located(self, lat: float, lon: float, label: str):
+        self._locating = False
+        self.me_refresh.setEnabled(True)
+        self.focus_btn.setEnabled(True)
+        focus = self._focus_pending
+        self._focus_pending = False
 
         self._me_obj = {"lat": lat, "lon": lon, "label": f"ME — {label}"}
-        self.list.appendPlainText(f"{time.strftime('%H:%M:%S')}  [*] ME located: {label} @ ({lat:.3f},{lon:.3f})")
+        self._log(f"[*] ME located: {label} @ ({lat:.3f},{lon:.3f})")
 
-        if self.me_enable.isChecked():
-            payload = json.dumps(self._me_obj)
-            self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
+        if focus and not self.me_enable.isChecked():
+            self.me_enable.setChecked(True)  # pushes the marker via _on_me_toggled
+        elif self.me_enable.isChecked():
+            self._push_me_marker()
+
+        if focus:
+            self._js("if (window.BLACKICE) { window.BLACKICE.focusMe(8); }")
+            self._log("[*] map focused on ME")
+
+    def _on_locate_failed(self, msg: str):
+        self._locating = False
+        self._focus_pending = False
+        self.me_refresh.setEnabled(True)
+        self.focus_btn.setEnabled(True)
+        self._log(f"[!] failed to locate ME ({msg})")
 
     def _on_me_toggled(self, enabled: bool):
         if not enabled:
-            self._js("window.BLACKICE && window.BLACKICE.clearRays();")
+            self._js("if (window.BLACKICE) { window.BLACKICE.clearMe(); }")
             return
         if self._me_obj is None:
             self.locate_me()
         else:
-            payload = json.dumps(self._me_obj)
-            self._js(f"window.BLACKICE && window.BLACKICE.setMyLocation({payload}); window.BLACKICE.redrawRays();")
+            self._push_me_marker()
 
     def push_points(self, points: List[dict]):
         lines = []
@@ -1055,22 +1317,35 @@ class MapTab(QtWidgets.QWidget):
         if lines:
             self.list.appendPlainText("\n".join(lines))
 
-        if HAVE_WEBENGINE and isinstance(self.web, QtWebEngineWidgets.QWebEngineView):
-            map_points = []
-            for p in points:
-                lat = float(p.get("lat", 0.0) or 0.0)
-                lon = float(p.get("lon", 0.0) or 0.0)
-                if abs(lat) < 1e-6 and abs(lon) < 1e-6:
-                    continue
-                map_points.append(p)
+        map_points = []
+        for p in points:
+            lat = float(p.get("lat", 0.0) or 0.0)
+            lon = float(p.get("lon", 0.0) or 0.0)
+            if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+                continue
+            map_points.append(p)
 
-            if map_points:
-                payload = json.dumps(map_points)
-                js = f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});"
-                self.web.page().runJavaScript(js)
+        if map_points:
+            payload = json.dumps(map_points)
+            self._js(f"window.BLACKICE && window.BLACKICE.upsertPoints({payload});")
 
-            if self.me_enable.isChecked() and self._me_obj is not None:
-                self._js("window.BLACKICE && window.BLACKICE.redrawRays();")
+        if self.me_enable.isChecked() and self._me_obj is not None:
+            self._js("window.BLACKICE && window.BLACKICE.redrawRays();")
+
+
+class ContactSortProxy(QtCore.QSortFilterProxyModel):
+    """Sorts by the UserRole key (timestamps, ports, hit counts, packed IPs)
+    when present, falling back to the display text."""
+
+    def lessThan(self, left, right):
+        lv = left.data(Qt.ItemDataRole.UserRole)
+        rv = right.data(Qt.ItemDataRole.UserRole)
+        if lv is not None and rv is not None:
+            try:
+                return lv < rv
+            except TypeError:
+                pass
+        return super().lessThan(left, right)
 
 
 class ConnectionsTab(QtWidgets.QWidget):
@@ -1114,11 +1389,12 @@ class ConnectionsTab(QtWidgets.QWidget):
         self.model = QtGui.QStandardItemModel(0, len(self.COLS), self)
         self.model.setHorizontalHeaderLabels(self.COLS)
 
-        self.proxy = QtCore.QSortFilterProxyModel(self)
+        self.proxy = ContactSortProxy(self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.proxy.setFilterKeyColumn(-1)
         self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
+        self.filter_edit.textChanged.connect(lambda _t: self._update_count())
 
         self.view = QtWidgets.QTableView()
         self.view.setModel(self.proxy)
@@ -1156,7 +1432,14 @@ class ConnectionsTab(QtWidgets.QWidget):
     def _clear(self):
         self.model.removeRows(0, self.model.rowCount())
         self._rows.clear()
-        self.count_lbl.setText("0 contacts")
+        self._update_count()
+
+    def _update_count(self):
+        total = self.model.rowCount()
+        shown = self.proxy.rowCount()
+        self.count_lbl.setText(
+            f"{total} contacts" if shown == total else f"{shown} of {total} contacts"
+        )
 
     def _make_item(self, text: str, sort_value=None) -> QtGui.QStandardItem:
         it = QtGui.QStandardItem(text)
@@ -1202,7 +1485,7 @@ class ConnectionsTab(QtWidgets.QWidget):
                 self._make_item(ts_str, ts),
                 self._make_item(ts_str, ts),
                 self._make_item(proto.upper()),
-                self._make_item(ip),
+                self._make_item(ip, ip_sort_key(ip)),
                 self._make_item(port_svc, port),
                 self._make_item(location),
                 self._make_item(process),
@@ -1219,14 +1502,19 @@ class ConnectionsTab(QtWidgets.QWidget):
             self.model.appendRow(row)
             self._rows[key] = self.model.rowCount() - 1
 
-        self.count_lbl.setText(f"{self.model.rowCount()} contacts")
+        self._update_count()
 
     def export_csv(self, path: str):
+        """Export what the table shows: the active filter and the current sort
+        order, so the file matches the view the user exported from."""
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(self.COLS)
-            for r in range(self.model.rowCount()):
-                w.writerow([self.model.item(r, c).text() for c in range(self.model.columnCount())])
+            for r in range(self.proxy.rowCount()):
+                w.writerow([
+                    self.proxy.index(r, c).data() or ""
+                    for c in range(self.proxy.columnCount())
+                ])
 
 
 class StatsTab(QtWidgets.QWidget):
@@ -1263,6 +1551,7 @@ class StatsTab(QtWidgets.QWidget):
         self.snapshot_btn.clicked.connect(self.snapshotRequested.emit)
 
         self._win_group = QtWidgets.QButtonGroup(self)
+        self.win_buttons: Dict[int, QtWidgets.QRadioButton] = {}
         win_row = QtWidgets.QHBoxLayout()
         for lbl_text, secs in HistoryGraph.WINDOWS.items():
             rb = QtWidgets.QRadioButton(lbl_text)
@@ -1275,6 +1564,7 @@ class StatsTab(QtWidgets.QWidget):
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, s=secs: checked and self.graph.set_window(s))
             self._win_group.addButton(rb)
+            self.win_buttons[secs] = rb
             win_row.addWidget(rb)
         win_row.addStretch(1)
 
@@ -1332,8 +1622,9 @@ class StatsTab(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, config: Optional[AppConfig] = None):
         super().__init__()
+        self.cfg = config if config is not None else AppConfig()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} ({APP_BUILD}) — Traffic Visualizer")
         self.resize(1200, 780)
 
@@ -1361,6 +1652,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.map, "MAP")
         self.tabs.addTab(self.stats, "STATS")
 
+        self.dash.set_config_enabled(self.cfg.enabled)
+        self.dash.configToggled.connect(self._on_config_toggled)
+
         self.dash.snapshotRequested.connect(lambda: self._snapshot(self.dash, "blackice_dashboard"))
         self.conns.snapshotRequested.connect(lambda: self._snapshot(self.conns, "blackice_contacts"))
         self.map.snapshotRequested.connect(lambda: self._snapshot(self.map, "blackice_map"))
@@ -1385,15 +1679,121 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ui_timer.timeout.connect(self._ui_tick)
         self._ui_timer.start(5000)
 
+        if self.cfg.enabled:
+            self.restore_state()
+            self.dash.set_event(f"[*] config restored ← {self.cfg.path}")
+
+    # ---- optional configuration persistence -----------------------------
+
+    def _on_config_toggled(self, on: bool):
+        self.cfg.set_enabled(on)
+        if on:
+            # Persist immediately so the choice sticks even if the app is killed.
+            self.save_state()
+            self.dash.set_event(f"[*] config saving ENABLED → {self.cfg.path}")
+        else:
+            self.cfg.clear_state()
+            self.dash.set_event("[*] config saving DISABLED (stored layout cleared)")
+
+    def save_state(self):
+        """Write window, layout and view state. A no-op while saving is off."""
+        if not self.cfg.enabled:
+            return
+        header = self.conns.view.horizontalHeader()
+        self.cfg.set("window/geometry", self.saveGeometry())
+        self.cfg.set("window/tab", self.tabs.currentIndex())
+        self.cfg.set("dash/iface", self.dash.iface.currentText())
+        self.cfg.set("stats/iface", self.stats.iface_combo.currentText())
+        self.cfg.set("stats/window", int(self.stats.graph._window))
+        self.cfg.set("contacts/header", header.saveState())
+        self.cfg.set("contacts/sort_col", header.sortIndicatorSection())
+        self.cfg.set("contacts/sort_order", header.sortIndicatorOrder().value)
+        self.cfg.set("contacts/filter", self.conns.filter_edit.text())
+        self.cfg.set("map/splitter", self.map.split.saveState())
+        self.cfg.set("map/show_me", self.map.me_enable.isChecked())
+        self.cfg.sync()
+
+    def restore_state(self):
+        """Apply saved state. A no-op while saving is off."""
+        if not self.cfg.enabled:
+            return
+
+        geo = self.cfg.get("window/geometry", None, QtCore.QByteArray)
+        if geo:
+            self.restoreGeometry(geo)
+            self._ensure_on_screen()
+
+        tab = self.cfg.get("window/tab", 0, int)
+        if 0 <= tab < self.tabs.count():
+            self.tabs.setCurrentIndex(tab)
+
+        self._restore_combo(self.dash.iface, self.cfg.get("dash/iface", "", str))
+        self._restore_combo(self.stats.iface_combo, self.cfg.get("stats/iface", "", str))
+
+        rb = self.stats.win_buttons.get(self.cfg.get("stats/window", 0, int))
+        if rb is not None:
+            rb.setChecked(True)
+
+        hdr_state = self.cfg.get("contacts/header", None, QtCore.QByteArray)
+        header = self.conns.view.horizontalHeader()
+        if hdr_state:
+            header.restoreState(hdr_state)
+        sort_col = self.cfg.get("contacts/sort_col", -1, int)
+        if 0 <= sort_col < self.conns.model.columnCount():
+            order = (Qt.SortOrder.DescendingOrder
+                     if self.cfg.get("contacts/sort_order", 0, int) == 1
+                     else Qt.SortOrder.AscendingOrder)
+            self.conns.view.sortByColumn(sort_col, order)
+        self.conns.filter_edit.setText(self.cfg.get("contacts/filter", "", str))
+
+        split_state = self.cfg.get("map/splitter", None, QtCore.QByteArray)
+        if split_state:
+            self.map.split.restoreState(split_state)
+        # Checking this kicks off a background locate, exactly as a click would.
+        self.map.me_enable.setChecked(self.cfg.get("map/show_me", False, bool))
+
+    @staticmethod
+    def _restore_combo(combo: QtWidgets.QComboBox, name: str):
+        idx = combo.findText(name) if name else -1
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _ensure_on_screen(self):
+        """A saved geometry can point at a monitor that is no longer attached."""
+        frame = self.frameGeometry()
+        if any(s.availableGeometry().intersects(frame)
+               for s in QtGui.QGuiApplication.screens()):
+            return
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            self.resize(1200, 780)
+            self.move(screen.availableGeometry().center() - self.rect().center())
+
     def _ui_tick(self):
         try:
-            current = self.dash.iface.currentText()
-            self.dash._populate_ifaces()
-            idx = self.dash.iface.findText(current)
-            if idx >= 0:
-                self.dash.iface.setCurrentIndex(idx)
+            nics = ["ALL"] + list(psutil.net_io_counters(pernic=True).keys())
+            for combo in (self.dash.iface, self.stats.iface_combo):
+                self._refresh_combo(combo, nics)
         except Exception:
             pass
+
+    @staticmethod
+    def _refresh_combo(combo: QtWidgets.QComboBox, items: List[str]):
+        # Rebuild only on actual NIC changes so an open dropdown isn't closed
+        # under the user every tick.
+        current_items = [combo.itemText(i) for i in range(combo.count())]
+        if current_items == items:
+            return
+        sel = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(items)
+        idx = combo.findText(sel)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        if combo.currentText() != sel:
+            # selection was lost (NIC vanished) — let listeners react
+            combo.currentTextChanged.emit(combo.currentText())
 
     def _on_traffic(self, snap: dict):
         self.dash.update_traffic(snap)
@@ -1413,12 +1813,28 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        pix = widget.grab()
+        pix = self._grab_widget(widget)
         ok = pix.save(path, "PNG")
         if ok:
             self.dash.set_event(f"[*] snapshot saved → {path}")
         else:
             self.dash.set_event(f"[!] snapshot FAILED → {path}")
+
+    def _grab_widget(self, widget: QtWidgets.QWidget) -> QtGui.QPixmap:
+        # QWebEngineView renders in a separate GPU process, so QWidget.grab()
+        # captures it as a black rectangle. Grab the on-screen pixels instead
+        # when the widget hosts a web view; fall back to grab() elsewhere
+        # (e.g. Wayland, where screen capture is denied).
+        has_web = HAVE_WEBENGINE and widget.findChild(QtWebEngineWidgets.QWebEngineView) is not None
+        if has_web and widget.isVisible():
+            handle = widget.window().windowHandle()
+            screen = handle.screen() if handle else None
+            if screen is not None:
+                tl = widget.mapToGlobal(QtCore.QPoint(0, 0))
+                pix = screen.grabWindow(0, tl.x(), tl.y(), widget.width(), widget.height())
+                if not pix.isNull():
+                    return pix
+        return widget.grab()
 
     def _export_csv(self):
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -1441,6 +1857,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().changeEvent(e)
 
     def closeEvent(self, e):
+        try:
+            self.save_state()
+        except Exception as exc:  # never block shutdown on a config write
+            print(f"[!] could not save config: {exc}", file=sys.stderr)
         try:
             self.poller.stop()
             self.poller.wait(1500)

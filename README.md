@@ -22,8 +22,10 @@ WARNING: this __not__ a hack tool, just a educational project made just 4fun
 - **CONTACTS tab** — sortable/filterable table of remote endpoints (with CSV export)
 - World map (Leaflet via QtWebEngine)  
 - Optional **My Location** marker
+- **⌖ MY LOCATION** button — geolocates you in the background and flies the map to your position
 - **Rays** from you to remote contacts  
 - **Snapshot button** on every tab — save the current view as PNG
+- **▣ SAVE CONFIG** toggle — optional, off by default: remembers window geometry, open tab and layout between runs
 - Offline GeoIP support (MaxMind GeoLite2)  
 - No packet sniffing by default (psutil‑based, safe mode)
 ---
@@ -91,6 +93,31 @@ Run build:
 ```
 ./build_win.cmd
 ```
+
+---
+
+## Configuration (optional)
+
+Saving is **off by default** — out of the box the app writes nothing and always
+starts from its defaults.
+
+Press **▣ SAVE CONFIG** in the top bar of the BLACK ICE tab to turn it on. From
+then on the following is restored on the next launch:
+
+- window geometry and maximized state (re-centered if the saved monitor is gone)
+- the selected tab
+- the interface picked on the BLACK ICE and STATS tabs, and the STATS time window
+- the CONTACTS column widths, sort column/direction and filter text
+- the MAP splitter position and the *Show my location + rays* checkbox
+
+State lives in a plain, hand-editable INI file:
+
+```
+~/.config/blackice/blackice_traffic.ini
+```
+
+Turning the toggle off deletes every stored key (the flag itself stays, so the
+app knows not to restore). Deleting the file by hand has the same effect.
 
 ---
 

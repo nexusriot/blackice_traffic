@@ -116,3 +116,66 @@ class TestIsPrivateish(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestIsLoopbackNic(unittest.TestCase):
+    def test_common_names(self):
+        self.assertTrue(bit.is_loopback_nic("lo"))
+        self.assertTrue(bit.is_loopback_nic("lo0"))
+        self.assertTrue(bit.is_loopback_nic("Loopback Pseudo-Interface 1"))
+
+    def test_real_nics(self):
+        for n in ("eth0", "wlp67s0", "docker0", "veth37bc6b9", "eno0"):
+            self.assertFalse(bit.is_loopback_nic(n), n)
+
+    def test_empty(self):
+        self.assertFalse(bit.is_loopback_nic(""))
+
+
+class TestIsLoopbackIp(unittest.TestCase):
+    def test_v4(self):
+        self.assertTrue(bit.is_loopback_ip("127.0.0.1"))
+        self.assertTrue(bit.is_loopback_ip("127.1.2.3"))
+
+    def test_v6(self):
+        self.assertTrue(bit.is_loopback_ip("::1"))
+
+    def test_public(self):
+        self.assertFalse(bit.is_loopback_ip("8.8.8.8"))
+
+    def test_garbage(self):
+        self.assertFalse(bit.is_loopback_ip("not-an-ip"))
+
+
+def _snetio(rx, tx):
+    import psutil
+    return psutil._common.snetio(tx, rx, 0, 0, 0, 0, 0, 0)
+
+
+class TestBuildSnapshot(unittest.TestCase):
+    def test_loopback_excluded_from_totals(self):
+        prev = {"lo": _snetio(0, 0), "eth0": _snetio(0, 0)}
+        now = {"lo": _snetio(125_000, 125_000), "eth0": _snetio(125_000, 125_000)}
+        snap = bit.build_snapshot(prev, now, 1.0)
+        # only eth0 counts: 125 kB/s == 1 Mb/s
+        self.assertEqual(snap["_totals"]["rx_bps"], 1_000_000.0)
+        self.assertEqual(snap["_totals"]["tx_bps"], 1_000_000.0)
+        # ...but lo is still reported so it can be selected in the combo
+        self.assertIn("lo", snap)
+        self.assertEqual(snap["lo"]["rx_bps"], 1_000_000.0)
+
+    def test_new_nic_without_baseline_is_skipped(self):
+        snap = bit.build_snapshot({}, {"eth0": _snetio(999, 999)}, 1.0)
+        self.assertNotIn("eth0", snap)
+        self.assertEqual(snap["_totals"]["rx_bps"], 0.0)
+
+    def test_counter_reset_clamps_to_zero(self):
+        prev = {"eth0": _snetio(10_000, 10_000)}
+        now = {"eth0": _snetio(5, 5)}
+        snap = bit.build_snapshot(prev, now, 1.0)
+        self.assertEqual(snap["eth0"]["rx_bps"], 0.0)
+        self.assertEqual(snap["_totals"]["rx_bps"], 0.0)
+
+    def test_totals_key_always_present(self):
+        self.assertEqual(bit.build_snapshot({}, {}, 1.0),
+                         {"_totals": {"rx_bps": 0.0, "tx_bps": 0.0}})
