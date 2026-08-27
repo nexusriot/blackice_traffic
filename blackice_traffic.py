@@ -32,7 +32,7 @@ except Exception:
     HAVE_GEOIP = False
 
 APP_NAME = "BLACK ICE"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 APP_BUILD = "alpha"
 
 _geoip_reader = None
