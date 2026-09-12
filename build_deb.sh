@@ -36,12 +36,18 @@ res_dir="$lib_dir/resources"
 mkdir -p "$bin_dir" "$lib_dir" "$res_dir"
 cp blackice_traffic "$bin_dir"
 cp resources/icon.ico "$res_dir"
+cp resources/world.bin "$res_dir"
 cp resources/icon.png "$lib_dir"
 cp resources/blackice_traffic.desktop "$lib_dir"
 cp LICENSE "$lib_dir"
 cp GeoLite2-City.mmdb "$lib_dir"
 
 sed -i "s/_version_/$version/g" "$folder_name/DEBIAN/control"
+
+# Measured, not hand-maintained: the bundled binary and the GeoIP database
+# both change size regularly and a stale Installed-Size misleads dpkg.
+installed_kb="$(du -s -k --exclude=DEBIAN "$folder_name" | cut -f1)"
+sed -i "s/_size_/$installed_kb/g" "$folder_name/DEBIAN/control"
 if [ "$arch" != "amd64" ]; then
   sed -i "s/Architecture: amd64/Architecture: $arch/g" "$folder_name/DEBIAN/control"
 fi

@@ -7,3 +7,5 @@ dist/
 GeoLite2-City.mmdb
 blackice_traffic.spec
 blackice_traffic
+GeoLite2-ASN.mmdb
+blackice-traffic_*.deb

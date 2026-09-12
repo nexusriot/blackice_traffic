@@ -1,9 +1,9 @@
 [Desktop Entry]
 Name=Blackice Traffic
-GenericName=blackice_traffic
+GenericName=Network Traffic Visualizer
 Exec=/usr/bin/blackice_traffic %U
 Terminal=false
 Icon=/usr/lib/blackice_traffic/icon.png
 Type=Application
-Categories=Application;Network;
-Comment=Blackice Network Traffic Monitor
+Categories=Network;Monitor;
+Comment=Visualize live network traffic, contacts and listening sockets

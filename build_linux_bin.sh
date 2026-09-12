@@ -5,4 +5,5 @@ echo "building linux bin"
 pyinstaller --windowed --hidden-import=psutil \
   --add-data="resources/icon.ico:resources/." \
   --add-data="resources/icon.png:resources/." \
+  --add-data="resources/world.bin:resources/." \
   --onefile --icon=resources/icon.ico blackice_traffic.py

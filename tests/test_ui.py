@@ -122,24 +122,24 @@ class TestConnectionsTabSorting(unittest.TestCase):
             self.tab.add_points([_point(ip="203.0.113.1")])
         for _ in range(1):
             self.tab.add_points([_point(ip="203.0.113.2")])
-        self.tab.proxy.sort(8, Qt.SortOrder.DescendingOrder)
-        hits = [int(v) for v in self._column_values(8)]
+        self.tab.proxy.sort(bit.ConnectionsTab.C_HITS, Qt.SortOrder.DescendingOrder)
+        hits = [int(v) for v in self._column_values(bit.ConnectionsTab.C_HITS)]
         self.assertEqual(hits, sorted(hits, reverse=True))
         self.assertEqual(hits[0], 10)
 
     def test_port_sort_numeric(self):
         for port in (8080, 443, 53):
             self.tab.add_points([_point(ip=f"203.0.113.{port % 250}", port=port)])
-        self.tab.proxy.sort(4, Qt.SortOrder.AscendingOrder)
-        ports = self._column_values(4)
+        self.tab.proxy.sort(bit.ConnectionsTab.C_PORT, Qt.SortOrder.AscendingOrder)
+        ports = self._column_values(bit.ConnectionsTab.C_PORT)
         self.assertEqual(ports, ["53 · DNS", "443 · HTTPS", "8080 · HTTP-ALT"])
 
     def test_ip_sort_numeric(self):
         for ip in ("203.0.113.10", "203.0.113.9", "9.9.9.9"):
             self.tab.add_points([_point(ip=ip)])
-        self.tab.proxy.sort(3, Qt.SortOrder.AscendingOrder)
+        self.tab.proxy.sort(bit.ConnectionsTab.C_IP, Qt.SortOrder.AscendingOrder)
         self.assertEqual(
-            self._column_values(3),
+            self._column_values(bit.ConnectionsTab.C_IP),
             ["9.9.9.9", "203.0.113.9", "203.0.113.10"],
         )
 
@@ -147,7 +147,8 @@ class TestConnectionsTabSorting(unittest.TestCase):
         self.tab.add_points([_point()])
         self.tab.add_points([_point()])
         self.assertEqual(self.tab.model.rowCount(), 1)
-        self.assertEqual(self.tab.model.item(0, 8).text(), "2")
+        self.assertEqual(
+            self.tab.model.item(0, bit.ConnectionsTab.C_HITS).text(), "2")
 
 
 class TestMapTabLocate(unittest.TestCase):
@@ -225,7 +226,8 @@ class TestConnScannerDedupe(unittest.TestCase):
 
     def _scan(self, scanner, conns):
         with mock.patch.object(bit.psutil, "net_connections", return_value=conns):
-            return scanner._scan_psutil()
+            contacts, _listeners, _states = scanner._scan_psutil()
+            return contacts
 
     def test_v4_mapped_and_plain_v4_are_one_contact(self):
         s = bit.ConnScanner()
@@ -301,12 +303,12 @@ class TestContactsExport(unittest.TestCase):
         self.tab.filter_edit.setText("8.8.8.8")
         rows = self._export()
         self.assertEqual(len(rows), 2)  # header + the one visible contact
-        self.assertEqual(rows[1][3], "8.8.8.8")
+        self.assertEqual(rows[1][bit.ConnectionsTab.C_IP], "8.8.8.8")
 
     def test_export_honors_sort_order(self):
-        self.tab.proxy.sort(4, Qt.SortOrder.AscendingOrder)
+        self.tab.proxy.sort(bit.ConnectionsTab.C_PORT, Qt.SortOrder.AscendingOrder)
         rows = self._export()
-        self.assertEqual([r[4] for r in rows[1:]],
+        self.assertEqual([r[bit.ConnectionsTab.C_PORT] for r in rows[1:]],
                          ["22 · SSH", "53 · DNS", "443 · HTTPS"])
 
     def test_export_header_and_full_table_by_default(self):

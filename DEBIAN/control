@@ -5,8 +5,12 @@ Priority: optional
 Architecture: amd64
 Depends: libc6, libglib2.0-0, libnss3, libgl1
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
-Installed-Size: 60054
+Installed-Size: _size_
 Description: Simple Network Traffic Visualizer
- Minimal hacker-style network traffic visualizer built with PyQt6.
+ Minimal hacker-style network traffic visualizer built with PyQt6. Shows live
+ per-interface bandwidth, the sockets this host is listening on, a table of
+ remote contacts with reverse-DNS and offline GeoIP, and a world map drawn
+ from a bundled coastline outline that needs no network access.
+ .
  Ships as a self-contained binary with Python, PyQt6 and all Python
  dependencies bundled; only a few system shared libraries are required.
