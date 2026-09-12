@@ -1356,6 +1356,15 @@ class TestReadmeMatchesCode(unittest.TestCase):
             with open(os.path.join(self.root, script), encoding="utf-8") as f:
                 self.assertIn("world.bin", f.read(), script)
 
+    def test_linux_build_does_not_need_an_activated_venv(self):
+        with open(os.path.join(self.root, "build_linux_bin.sh"), encoding="utf-8") as f:
+            build = f.read()
+        # A bare `pyinstaller` resolves only inside an activated venv, so `make`
+        # from a plain shell died with "command not found".
+        self.assertNotRegex(build, r"(?m)^\s*pyinstaller\s")
+        self.assertIn(".venv/bin/python", build)
+        self.assertIn("-m PyInstaller", build)
+
     def test_control_file_has_no_hand_maintained_size(self):
         with open(os.path.join(self.root, "DEBIAN", "control"), encoding="utf-8") as f:
             control = f.read()
