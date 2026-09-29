@@ -150,6 +150,30 @@ link-local addresses are never flagged, so your own LAN does not drown the signa
 Rows older than 30 days are dropped on startup. Turning the toggle off closes the
 database and stops recording.
 
+Building on a fresh machine
+-------------
+
+Two system packages and one command:
+
+```bash
+sudo apt-get install build-essential dpkg-dev python3-venv python3-pip
+make deb
+```
+
+The build creates `./.venv` from `requirements.txt` on first run (PyInstaller
+lives there, not on the system Python) and drops the `.deb` in `build/`.
+`make bin` stops after the standalone binary. `make distclean` removes the
+venv along with the build output.
+
+The MaxMind `GeoLite2-City.mmdb` / `GeoLite2-ASN.mmdb` databases are not
+redistributable and are not in the repository. If you drop them in the project
+root before building they get bundled into the package; without them the build
+succeeds and the geolocation columns stay empty.
+
+To build against an interpreter you manage yourself, point `PYTHON=` at it —
+the build then never touches `.venv` and fails if PyInstaller is missing there.
+`NO_BOOTSTRAP=1` disables the automatic venv creation entirely.
+
 Building deb package
 ------------- 
 
@@ -159,7 +183,7 @@ sudo apt-get install git devscripts build-essential lintian upx-ucl
 ```
 Run build:
 ```
-./build_deb.sh
+make deb        # or: ./build_linux_bin.sh && ./build_deb.sh
 ```
 
 Building linux binary (PyInstaller) 

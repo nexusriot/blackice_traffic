@@ -40,7 +40,18 @@ cp resources/world.bin "$res_dir"
 cp resources/icon.png "$lib_dir"
 cp resources/blackice_traffic.desktop "$lib_dir"
 cp LICENSE "$lib_dir"
-cp GeoLite2-City.mmdb "$lib_dir"
+
+# The MaxMind databases are not redistributable and are gitignored, so a fresh
+# clone has none. They are optional at runtime (the app falls back to no
+# geolocation), so package them when present rather than failing the build.
+for db in GeoLite2-City.mmdb GeoLite2-ASN.mmdb; do
+  if [ -f "$db" ]; then
+    cp "$db" "$lib_dir"
+    echo "bundling $db"
+  else
+    echo "NOTE: $db not found - building without it (geolocation stays empty)."
+  fi
+done
 
 sed -i "s/_version_/$version/g" "$folder_name/DEBIAN/control"
 

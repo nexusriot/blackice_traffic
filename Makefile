@@ -1,15 +1,29 @@
 VERSION := $(shell sed -n 's/^APP_VERSION *= *"\(.*\)".*/\1/p' blackice_traffic.py)
 HOST_ARCH := $(shell dpkg --print-architecture 2>/dev/null || uname -m)
 
-.PHONY: all bin deb deb-amd64 deb-arm64 clean help
+.PHONY: all venv bin deb deb-amd64 deb-arm64 clean distclean help
 
 help:
 	@echo "blackice_traffic build targets:"
+	@echo "  make venv        - create ./.venv and install requirements.txt"
 	@echo "  make bin         - build standalone binary via PyInstaller (host arch: $(HOST_ARCH))"
 	@echo "  make deb         - build .deb for host arch ($(HOST_ARCH))"
 	@echo "  make deb-amd64   - build amd64 .deb (must run on amd64)"
 	@echo "  make deb-arm64   - build arm64 .deb (must run on arm64)"
 	@echo "  make clean       - remove build artifacts"
+	@echo "  make distclean   - also remove ./.venv"
+	@echo ""
+	@echo "On a fresh machine just run 'make deb' - the build creates ./.venv itself."
+
+# Explicit target for anyone who wants the environment without a build;
+# build_linux_bin.sh creates the same .venv on demand, so it is optional.
+venv: .venv/bin/python
+
+.venv/bin/python: requirements.txt
+	python3 -m venv .venv
+	.venv/bin/python -m pip install --upgrade pip
+	.venv/bin/python -m pip install -r requirements.txt
+	@touch .venv/bin/python
 
 bin: blackice_traffic
 
@@ -33,4 +47,7 @@ deb-arm64: bin
 
 clean:
 	rm -rf build/ dist/ __pycache__/
-	rm -f blackice-traffic_*.deb
+	rm -f blackice-traffic_*.deb blackice_traffic.spec blackice_traffic
+
+distclean: clean
+	rm -rf .venv/
