@@ -7,11 +7,15 @@ Run from the project root with the runtime deps installed (PyQt6, psutil):
 """
 import collections
 import csv
+import io
 import json
 import os
 import re
 import shutil
+import socket
+import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1163,7 +1167,7 @@ class TestMainWindowFeatures(unittest.TestCase):
     def test_listen_tab_exists_and_receives_listeners(self):
         w = self._window()
         self.assertEqual([w.tabs.tabText(i) for i in range(w.tabs.count())],
-                         ["BLACK ICE", "CONTACTS", "LISTEN", "MAP", "STATS"])
+                         ["BLACK ICE", "CONTACTS", "LISTEN", "MAP", "STATS", "HISTORY"])
         w.listen.set_listeners([_listener()])
         self.assertEqual(w.listen.model.rowCount(), 1)
 
@@ -1227,7 +1231,8 @@ class TestMainWindowFeatures(unittest.TestCase):
         w = self._window()
         w.append_watchlist("cidr", "203.0.113.0/24", "TESTNET")
         w._on_points([_contact()])
-        self.assertIn("WATCHLIST HIT", w.dash.alert_lbl.text())
+        self.assertIn("WATCHLIST", w.dash.alert_lbl.text())
+        self.assertIn("203.0.113.9:443", w.dash.alert_lbl.text())
         self.assertIn("[!] ALERT", w.dash.log.toPlainText())
 
     def test_resolved_host_reaches_the_table(self):
@@ -1402,10 +1407,1886 @@ class TestMainWindowDocClaims(unittest.TestCase):
         self.w.save_state()
         self.assertEqual(written, {
             "window/geometry", "window/tab", "dash/iface", "dash/fx",
-            "dash/hide_virtual", "stats/iface", "stats/window", "contacts/header",
+            "dash/hide_virtual", "dash/scan_interval",
+            "stats/iface", "stats/window", "contacts/header",
             "contacts/sort_col", "contacts/sort_order", "contacts/filter",
-            "map/splitter", "map/show_me", "map/mode", "history/enabled",
+            "map/splitter", "map/show_me", "map/mode", "map/cluster",
+            "window/tray", "history/enabled",
             "listen/world_only", "listen/header"})
+
+
+# --------------------------------------------------------------------------
+# regressions for the 0.12.1 fix round
+
+
+class TestUdpListenersAreReported(unittest.TestCase):
+    """A UDP socket never reports LISTEN, so keying the listening set on that
+    status alone hid every bound UDP port from the attack-surface tab."""
+
+    Addr = collections.namedtuple("Addr", "ip port")
+    Conn = collections.namedtuple("Conn", "fd family type laddr raddr status pid")
+
+    def _scan(self, conns):
+        scanner = bit.ConnScanner()
+        with mock.patch.object(bit.psutil, "net_connections", return_value=conns):
+            return scanner._scan_psutil()
+
+    def test_bound_udp_socket_is_listed(self):
+        conns = [self.Conn(1, 2, 2, self.Addr("0.0.0.0", 53), (), "NONE", None)]
+        _c, listening, _s = self._scan(conns)
+        self.assertEqual(len(listening), 1)
+        self.assertEqual(listening[0].proto, "udp")
+        self.assertEqual(listening[0].port, 53)
+        self.assertEqual(listening[0].exposure, bit.EXPOSURE_WORLD)
+
+    def test_sensitive_udp_port_still_gets_its_note(self):
+        conns = [self.Conn(1, 2, 2, self.Addr("::", 5900), (), "NONE", None)]
+        _c, listening, _s = self._scan(conns)
+        self.assertTrue(listening[0].note)
+
+    def test_loopback_udp_bind_is_local(self):
+        conns = [self.Conn(1, 2, 2, self.Addr("127.0.0.1", 323), (), "NONE", None)]
+        _c, listening, _s = self._scan(conns)
+        self.assertEqual(listening[0].exposure, bit.EXPOSURE_LOCAL)
+
+    def test_tcp_listener_is_unaffected(self):
+        conns = [self.Conn(1, 2, 1, self.Addr("0.0.0.0", 22), (), "LISTEN", None)]
+        _c, listening, _s = self._scan(conns)
+        self.assertEqual(listening[0].proto, "tcp")
+
+    def test_udp_state_histogram_is_still_not_polluted(self):
+        conns = [self.Conn(1, 2, 2, self.Addr("0.0.0.0", 53), (), "NONE", None)]
+        _c, _l, states = self._scan(conns)
+        self.assertEqual(states, {})
+
+    def test_process_name_is_looked_up_once_per_pid(self):
+        conns = [self.Conn(i, 2, 1, self.Addr("0.0.0.0", 0),
+                           self.Addr("203.0.113.%d" % i, 443), "ESTABLISHED", 77)
+                 for i in range(1, 6)]
+        proc = mock.Mock()
+        proc.name.return_value = "curl"
+        scanner = bit.ConnScanner()
+        with mock.patch.object(bit.psutil, "net_connections", return_value=conns), \
+             mock.patch.object(bit.psutil, "Process", return_value=proc) as factory:
+            contacts, _l, _s = scanner._scan_psutil()
+        self.assertEqual(len(contacts), 5)
+        self.assertEqual(factory.call_count, 1)
+        self.assertTrue(all(c.process == "curl" for c in contacts))
+
+
+class TestCsvInjection(unittest.TestCase):
+    """Hostnames come from PTR records and org strings from GeoIP: both are
+    chosen by somebody else and both end up in a spreadsheet."""
+
+    def test_formula_prefixes_are_defused(self):
+        for raw in ("=1+1", "+1", "-1", "@SUM(A1)", "\tx", "\rx"):
+            self.assertTrue(bit.csv_safe(raw).startswith("'"), raw)
+
+    def test_ordinary_values_are_untouched(self):
+        for raw in ("203.0.113.9", "host.example", "AS13335 CLOUDFLARE", ""):
+            self.assertEqual(bit.csv_safe(raw), raw)
+
+    def test_none_becomes_empty(self):
+        self.assertEqual(bit.csv_safe(None), "")
+
+    def test_headless_export_defuses_a_hostile_ptr(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-csv-")
+        try:
+            path = os.path.join(tmp, "contacts.csv")
+            bit.write_contacts_csv(path, [{"ip": "203.0.113.9", "port": 443,
+                                           "host": '=cmd|\'/c calc\'!A1'}])
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn("'=cmd", body)
+            self.assertNotIn(",=cmd", body)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_contacts_tab_export_defuses_a_hostile_ptr(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "host": "=HYPERLINK(\"x\")"}])
+        tmp = tempfile.mkdtemp(prefix="blackice-csv-")
+        try:
+            path = os.path.join(tmp, "contacts.csv")
+            tab.export_csv(path)
+            with open(path, encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            self.assertIn("'=HYPERLINK(\"x\")", rows[1])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            tab.deleteLater()
+
+
+class TestContactTableCap(unittest.TestCase):
+    """A host making short-lived connections produces endpoints forever."""
+
+    def setUp(self):
+        self.tab = bit.ConnectionsTab()
+        self.tab.resolve_hosts = False
+        self.tab.MAX_ROWS = 40
+        self.tab.EVICT_CHUNK = 10
+
+    def tearDown(self):
+        self.tab.deleteLater()
+        _app.processEvents()
+
+    def _flood(self, n, start=0, ts=None):
+        now = ts if ts is not None else time.time()
+        self.tab.add_points([
+            {"ip": "203.0.113.%d" % (i % 254 + 1), "port": 1000 + i, "proto": "tcp",
+             "ts": now + i, "location": "XX"} for i in range(start, start + n)])
+
+    def test_table_stops_growing(self):
+        for chunk in range(12):
+            self._flood(20, start=chunk * 20)
+        self.assertLessEqual(self.tab.model.rowCount(), self.tab.MAX_ROWS + self.tab.EVICT_CHUNK)
+
+    def test_row_index_survives_eviction(self):
+        self._flood(120)
+        # Every surviving key must still point at its own row.
+        for key, row in self.tab._rows.items():
+            item = self.tab.model.item(row, self.tab.C_FIRST)
+            self.assertIsNotNone(item)
+            self.assertEqual(item.data(self.tab.KEY_ROLE), key)
+        self.assertEqual(set(self.tab._rows), set(self.tab._points))
+
+    def test_the_oldest_contacts_are_the_ones_dropped(self):
+        base = time.time()
+        self._flood(120, ts=base)
+        survivors = {self.tab._points[k]["port"] for k in self.tab._rows}
+        self.assertNotIn(1000, survivors)       # first contact, oldest
+        self.assertIn(1000 + 119, survivors)    # last contact, newest
+
+    def test_an_evicted_endpoint_can_come_back(self):
+        self._flood(120)
+        self.tab.add_points([{"ip": "203.0.113.1", "port": 1000, "proto": "tcp",
+                              "ts": time.time(), "location": "XX"}])
+        self.assertIn("tcp:203.0.113.1:1000", self.tab._rows)
+
+
+class TestWorldMapPointCap(unittest.TestCase):
+    def test_points_stop_growing(self):
+        w = bit.WorldMapWidget()
+        w.MAX_POINTS = 50
+        for chunk in range(5):
+            w.set_points([{"proto": "tcp", "ip": "203.0.113.%d" % (i % 254),
+                           "port": 1000 + i, "lat": 10.0, "lon": 20.0}
+                          for i in range(chunk * 30, chunk * 30 + 30)])
+        self.assertLessEqual(w.point_count(), 50)
+        w.deleteLater()
+
+    def test_the_newest_point_survives(self):
+        w = bit.WorldMapWidget()
+        w.MAX_POINTS = 5
+        w.set_points([{"proto": "tcp", "ip": "203.0.113.%d" % i, "port": 1,
+                       "lat": 1.0, "lon": 2.0} for i in range(20)])
+        self.assertIn("tcp:203.0.113.19:1", w._points)
+        w.deleteLater()
+
+
+class TestMapSplitterCanBeNarrowed(unittest.TestCase):
+    """The stacked widget's implicit minimum used to pin the map pane wide,
+    which silently discarded any saved splitter position below it."""
+
+    def test_map_pane_can_be_made_smaller_than_the_list(self):
+        tab = bit.MapTab()
+        tab.split.resize(800, 400)
+        tab.split.setSizes([250, 550])
+        map_w, list_w = tab.split.sizes()
+        self.assertLess(map_w, list_w)
+        tab.deleteLater()
+
+    def test_saved_position_round_trips(self):
+        a = bit.MapTab()
+        a.split.resize(800, 400)
+        a.split.setSizes([250, 550])
+        state = a.split.saveState()
+        b = bit.MapTab()
+        b.split.resize(800, 400)
+        self.assertTrue(b.split.restoreState(state))
+        map_w, list_w = b.split.sizes()
+        self.assertLess(map_w, list_w)
+        a.deleteLater()
+        b.deleteLater()
+
+
+class TestRuleSetCidrIndexing(unittest.TestCase):
+    """Each cidr rule has to match against its own network, not whichever
+    network happens to appear first in the index."""
+
+    def test_each_rule_matches_only_its_own_network(self):
+        rs = bit.RuleSet.parse(
+            "cidr 203.0.113.0/24 DOCS\n"
+            "cidr 198.51.100.0/24 TEST2\n"
+            "cidr 192.0.2.0/24 TEST1\n")
+        self.assertEqual(rs.match({"ip": "198.51.100.5"}), ["TEST2"])
+        self.assertEqual(rs.match({"ip": "192.0.2.5"}), ["TEST1"])
+        self.assertEqual(rs.match({"ip": "203.0.113.5"}), ["DOCS"])
+        self.assertEqual(rs.match({"ip": "8.8.8.8"}), [])
+
+    def test_overlapping_rules_all_fire_in_file_order(self):
+        rs = bit.RuleSet.parse("cidr 203.0.113.0/24 WIDE\ncidr 203.0.113.5/32 EXACT\n")
+        self.assertEqual(rs.match({"ip": "203.0.113.5"}), ["WIDE", "EXACT"])
+
+    def test_a_malformed_cidr_rule_does_not_shift_the_others(self):
+        rs = bit.RuleSet([bit.WatchRule("cidr", "not-a-network", "BAD"),
+                          bit.WatchRule("cidr", "203.0.113.0/24", "GOOD")])
+        self.assertEqual(rs.match({"ip": "203.0.113.5"}), ["GOOD"])
+
+    def test_v4_rule_does_not_match_a_v6_address(self):
+        rs = bit.RuleSet.parse("cidr 0.0.0.0/0 ANY4\n")
+        self.assertEqual(rs.match({"ip": "2001:db8::1"}), [])
+
+
+class TestSelftestSkipsOptionalGeoip(unittest.TestCase):
+    def test_absent_geoip_database_is_a_skip_not_a_failure(self):
+        with mock.patch.object(bit, "HAVE_GEOIP", False), \
+             mock.patch.object(bit, "_geoip_reader", None), \
+             mock.patch.object(bit, "init_geoip"), \
+             mock.patch.object(bit, "init_asn"):
+            with mock.patch("sys.stdout", new=io.StringIO()) as out:
+                rc = bit.run_selftest()
+        self.assertEqual(rc, 0)
+        self.assertIn("[SKIP] geoip", out.getvalue())
+
+    def test_a_real_failure_still_exits_non_zero(self):
+        with mock.patch.object(bit, "human_bps", return_value="wrong"):
+            with mock.patch("sys.stdout", new=io.StringIO()) as out:
+                rc = bit.run_selftest()
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] units", out.getvalue())
+
+
+# --------------------------------------------------------------------------
+# 0.13.0: honest status line, listener diffing, per-process bytes, history
+# tab, rule editor, NDJSON stream, map clustering, alert rate limiting
+
+
+class TestStatusLineIsHonest(unittest.TestCase):
+    def test_it_no_longer_claims_to_sniff_or_filter(self):
+        d = bit.BlackIceDashboard()
+        self.assertNotIn("PASSIVE SNIFF", d.sub.text())
+        self.assertNotIn("SYN-FILTER", d.sub.text())
+        self.assertIn("NO PACKET CAPTURE", d.sub.text())
+        d.deleteLater()
+
+    def test_capabilities_are_appended_and_updated(self):
+        d = bit.BlackIceDashboard()
+        d.set_status("GEOIP", "OFF")
+        d.set_status("HISTORY", "OFF")
+        self.assertIn("GEOIP: OFF", d.sub.text())
+        self.assertIn("HISTORY: OFF", d.sub.text())
+        d.set_status("HISTORY", "ON")
+        self.assertIn("HISTORY: ON", d.sub.text())
+        self.assertNotIn("HISTORY: OFF", d.sub.text())
+        d.deleteLater()
+
+
+class TestListenerDiff(unittest.TestCase):
+    def test_the_first_inventory_is_a_baseline_not_a_hundred_openings(self):
+        self.assertEqual(bit.listener_diff(None, {"a": {}}), ([], []))
+
+    def test_opened_and_closed_are_both_reported(self):
+        prev = {"tcp:0.0.0.0:22": {"port": 22}}
+        cur = {"tcp:0.0.0.0:80": {"port": 80}}
+        opened, closed = bit.listener_diff(prev, cur)
+        self.assertEqual([l["port"] for l in opened], [80])
+        self.assertEqual([l["port"] for l in closed], [22])
+
+    def test_an_unchanged_inventory_is_silent(self):
+        same = {"tcp:0.0.0.0:22": {"port": 22}}
+        self.assertEqual(bit.listener_diff(dict(same), same), ([], []))
+
+    def test_describe_names_port_process_and_exposure(self):
+        line = bit.ListenersTab.describe(_listener(port=22, process="sshd", pid=9))
+        self.assertIn("TCP 0.0.0.0:22", line)
+        self.assertIn("SSH", line)
+        self.assertIn("sshd/9", line)
+        self.assertIn(bit.EXPOSURE_WORLD, line)
+
+    def test_tab_emits_nothing_on_the_first_scan(self):
+        tab = bit.ListenersTab()
+        seen = []
+        tab.listenersOpened.connect(seen.append)
+        tab.set_listeners([_listener(port=22), _listener(port=80)])
+        self.assertEqual(seen, [])
+        tab.deleteLater()
+
+    def test_tab_emits_the_second_time_round(self):
+        tab = bit.ListenersTab()
+        opened, closed = [], []
+        tab.listenersOpened.connect(opened.extend)
+        tab.listenersClosed.connect(closed.extend)
+        tab.set_listeners([_listener(port=22)])
+        tab.set_listeners([_listener(port=22), _listener(port=6379)])
+        self.assertEqual([l["port"] for l in opened], [6379])
+        tab.set_listeners([_listener(port=22)])
+        self.assertEqual([l["port"] for l in closed], [6379])
+        tab.deleteLater()
+
+
+class TestEphemeralPortNoise(unittest.TestCase):
+    """A client churning outbound sockets must not drown the sentinel."""
+
+    def test_the_kernel_range_is_read_when_available(self):
+        bit._port_range_cache = None
+        with mock.patch("builtins.open", mock.mock_open(read_data="10000\t20000\n")):
+            self.assertEqual(bit.local_port_range(), (10000, 20000))
+        bit._port_range_cache = None
+
+    def test_an_unreadable_range_falls_back(self):
+        bit._port_range_cache = None
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertEqual(bit.local_port_range(), bit._DEFAULT_PORT_RANGE)
+        bit._port_range_cache = None
+
+    def test_a_churned_ephemeral_port_is_not_notable(self):
+        lo, _hi = bit.local_port_range()
+        self.assertFalse(bit.is_notable_listener(
+            {"port": lo + 1, "proto": "udp", "note": ""}))
+
+    def test_a_service_port_is_always_notable(self):
+        self.assertTrue(bit.is_notable_listener({"port": 80, "note": ""}))
+
+    def test_a_known_service_high_in_the_range_is_still_notable(self):
+        self.assertTrue(bit.is_notable_listener({"port": 51820, "note": ""}))
+
+    def test_a_sensitive_note_overrides_everything(self):
+        lo, _hi = bit.local_port_range()
+        self.assertTrue(bit.is_notable_listener({"port": lo + 2, "note": "DATABASE"}))
+
+    def test_the_noisy_socket_still_appears_in_the_inventory(self):
+        tab = bit.ListenersTab()
+        lo, _hi = bit.local_port_range()
+        tab.set_listeners([_listener(port=lo + 3, proto="udp", process="syncthing")])
+        self.assertEqual(tab.model.rowCount(), 1)
+        tab.deleteLater()
+
+    def test_it_is_not_logged_as_a_port_opening(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-noise-")
+        try:
+            w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+                os.path.join(tmp, "cfg.ini"), QtCore.QSettings.Format.IniFormat)))
+            lo, _hi = bit.local_port_range()
+            w._on_listeners_opened([
+                _listener(port=lo + 4, proto="udp", process="syncthing")])
+            self.assertNotIn("PORT OPENED", w.dash.log.toPlainText())
+            w._on_listeners_opened([_listener(port=22, process="sshd")])
+            self.assertIn("PORT OPENED", w.dash.log.toPlainText())
+            w.close()
+            w.deleteLater()
+            _app.processEvents()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestProcTrafficSampler(unittest.TestCase):
+    SS = (
+        'ESTAB 0 0 192.168.1.5:40994 199.232.197.91:443 '
+        'users:(("firefox",pid=1283969,fd=229))\n'
+        '\t cubic rtt:29.6 bytes_sent:4720 bytes_acked:4721 bytes_received:6099 '
+        'segs_out:20\n'
+        'ESTAB 0 0 192.168.1.5:37008 88.99.166.23:12476\n'
+        '\t cubic rtt:57.6 bytes_sent:1509 bytes_acked:1510 bytes_received:92991\n'
+    )
+
+    def _sampler(self):
+        s = bit.ProcTrafficSampler()
+        s.enabled = True
+        return s
+
+    def test_parse_pulls_bytes_and_owner(self):
+        parsed = bit.ProcTrafficSampler.parse(self.SS)
+        self.assertEqual(len(parsed), 2)
+        proc, rx, tx = parsed["192.168.1.5:40994|199.232.197.91:443"]
+        self.assertEqual((proc, rx, tx), ("firefox", 6099, 4720))
+
+    def test_a_socket_without_a_named_owner_is_not_dropped(self):
+        parsed = bit.ProcTrafficSampler.parse(self.SS)
+        proc, rx, _tx = parsed["192.168.1.5:37008|88.99.166.23:12476"]
+        self.assertEqual(proc, bit.UNATTRIBUTED)
+        self.assertEqual(rx, 92991)
+
+    def test_older_kernels_without_bytes_sent_fall_back_to_bytes_acked(self):
+        text = ('ESTAB 0 0 a:1 b:2 users:(("x",pid=1,fd=2))\n'
+                '\t cubic bytes_acked:500 bytes_received:100\n')
+        parsed = bit.ProcTrafficSampler.parse(text)
+        self.assertEqual(parsed["a:1|b:2"], ("x", 100, 500))
+
+    def test_a_socket_with_no_info_line_is_skipped(self):
+        parsed = bit.ProcTrafficSampler.parse("LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n")
+        self.assertEqual(parsed, {})
+
+    def test_the_first_pass_only_establishes_a_baseline(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            self.assertEqual(s.sample(), {})
+
+    def test_the_second_pass_counts_the_delta_only(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            s.sample()
+        grown = self.SS.replace("bytes_received:6099", "bytes_received:9099")
+        with mock.patch.object(s, "_run", return_value=grown):
+            totals = s.sample()
+        self.assertEqual(totals["firefox"], (3000, 0))
+
+    def test_a_socket_appearing_after_the_baseline_counts_in_full(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=""):
+            s.sample()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            totals = s.sample()
+        self.assertEqual(totals["firefox"], (6099, 4720))
+
+    def test_a_reused_address_pair_does_not_produce_a_negative_delta(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            s.sample()
+        reset = self.SS.replace("bytes_received:6099", "bytes_received:12")
+        with mock.patch.object(s, "_run", return_value=reset):
+            totals = s.sample()
+        self.assertEqual(totals["firefox"][0], 12)
+
+    def test_a_closed_socket_keeps_the_bytes_it_moved(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=""):
+            s.sample()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            s.sample()
+        with mock.patch.object(s, "_run", return_value=""):
+            totals = s.sample()
+        self.assertEqual(totals["firefox"], (6099, 4720))
+
+    def test_top_ranks_by_total_bytes(self):
+        s = self._sampler()
+        s.totals = {"a": (10, 10), "b": (500, 0), "c": (0, 0)}
+        self.assertEqual(s.top(), [("b", 500), ("a", 20)])
+
+    def test_it_disables_itself_after_repeated_failures(self):
+        s = self._sampler()
+        with mock.patch.object(bit.subprocess, "run", side_effect=OSError("nope")):
+            for _ in range(bit.ProcTrafficSampler.MAX_FAILURES):
+                s.sample()
+        self.assertFalse(s.enabled)
+        self.assertIn("nope", s.error)
+
+    def test_a_non_zero_exit_is_reported_not_raised(self):
+        s = self._sampler()
+        done = subprocess.CompletedProcess(["ss"], 2, "", "operation not permitted")
+        with mock.patch.object(bit.subprocess, "run", return_value=done):
+            self.assertEqual(s.sample(), {})
+        self.assertIn("not permitted", s.error)
+
+    def test_a_hung_ss_is_given_up_on(self):
+        s = self._sampler()
+        with mock.patch.object(bit.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("ss", 4.0)):
+            self.assertEqual(s.sample(), {})
+        self.assertFalse(s.enabled is None)
+
+    def test_a_missing_binary_is_reported_not_raised(self):
+        with mock.patch.object(bit.shutil, "which", return_value=None):
+            s = bit.ProcTrafficSampler()
+        self.assertFalse(s.enabled)
+        self.assertEqual(s.sample(), {})
+
+
+class TestStatsTalkerPanel(unittest.TestCase):
+    def setUp(self):
+        self.tab = bit.StatsTab()
+
+    def tearDown(self):
+        self.tab.deleteLater()
+        _app.processEvents()
+
+    def test_it_counts_endpoints_until_real_bytes_arrive(self):
+        self.tab.set_rollups([{"process": "curl"}, {"process": "curl"}])
+        self.assertEqual(self.tab.proc_panel.title, bit.StatsTab.TALKERS_BY_COUNT)
+        self.assertEqual(self.tab.proc_panel._rows, [("curl", 2)])
+
+    def test_real_bytes_take_over_the_panel(self):
+        self.tab.set_proc_io({"firefox": (2_000_000, 1_000_000), "sshd": (10, 10)})
+        self.assertEqual(self.tab.proc_panel.title, bit.StatsTab.TALKERS_BY_BYTES)
+        self.assertEqual(self.tab.proc_panel._rows[0], ("firefox", 3_000_000))
+        self.assertEqual(self.tab.proc_panel._fmt, bit.human_bytes)
+
+    def test_bytes_survive_a_rollup_refresh(self):
+        self.tab.set_proc_io({"firefox": (2_000_000, 1_000_000)})
+        self.tab.set_rollups([{"process": "curl"}])
+        self.assertEqual(self.tab.proc_panel.title, bit.StatsTab.TALKERS_BY_BYTES)
+
+    def test_a_process_that_moved_nothing_is_not_listed(self):
+        self.tab.set_proc_io({"idle": (0, 0)})
+        self.assertEqual(self.tab.proc_panel._rows, [])
+
+
+class TestHistoryTab(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-hist-")
+        self.store = bit.SessionStore(os.path.join(self.tmp, "history.db"))
+        self.tab = bit.HistoryTab()
+
+    def tearDown(self):
+        self.store.close()
+        self.tab.deleteLater()
+        _app.processEvents()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _record(self, n=3):
+        self.store.open()
+        now = time.time()
+        self.store.record_contacts([
+            {"ip": "203.0.113.%d" % i, "port": 440 + i, "proto": "tcp", "ts": now + i,
+             "location": "Berlin DE", "country": "DE", "asn": "AS3320 DTAG",
+             "process": "firefox", "host": "h%d.example" % i}
+            for i in range(n)])
+
+    def test_it_says_so_when_recording_is_off(self):
+        self.tab.set_store(self.store)
+        self.assertEqual(self.tab.model.rowCount(), 0)
+        self.assertIn("OFF", self.tab.summary.text())
+        self.assertFalse(self.tab.export_btn.isEnabled())
+
+    def test_recorded_contacts_reach_the_table(self):
+        self._record(3)
+        self.tab.set_store(self.store)
+        self.assertEqual(self.tab.model.rowCount(), 3)
+        self.assertIn("3 recorded contacts", self.tab.summary.text())
+        self.assertTrue(self.tab.export_btn.isEnabled())
+
+    def test_columns_carry_what_was_stored(self):
+        self._record(1)
+        self.tab.set_store(self.store)
+        texts = [self.tab.model.item(0, c).text()
+                 for c in range(self.tab.model.columnCount())]
+        self.assertIn("203.0.113.0", texts)
+        self.assertIn("h0.example", texts)
+        self.assertIn("AS3320 DTAG", texts)
+
+    def test_timestamps_are_absolute_because_history_spans_days(self):
+        self._record(1)
+        self.tab.set_store(self.store)
+        self.assertRegex(self.tab.model.item(0, self.tab.C_LAST).text(),
+                         r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+    def test_the_filter_narrows_the_view(self):
+        self._record(3)
+        self.tab.set_store(self.store)
+        self.tab.filter_edit.setText("203.0.113.1")
+        self.assertEqual(self.tab.proxy.rowCount(), 1)
+
+    def test_forget_all_empties_the_database(self):
+        self._record(3)
+        self.tab.set_store(self.store)
+        with mock.patch.object(QtWidgets.QMessageBox, "question",
+                               return_value=QtWidgets.QMessageBox.StandardButton.Yes):
+            self.tab._confirm_forget()
+        self.assertEqual(self.tab.model.rowCount(), 0)
+        self.assertEqual(self.store.counts()[0], 0)
+
+    def test_cancelling_forget_keeps_everything(self):
+        self._record(3)
+        self.tab.set_store(self.store)
+        with mock.patch.object(QtWidgets.QMessageBox, "question",
+                               return_value=QtWidgets.QMessageBox.StandardButton.Cancel):
+            self.tab._confirm_forget()
+        self.assertEqual(self.store.counts()[0], 3)
+
+    def test_export_writes_the_visible_rows(self):
+        self._record(2)
+        self.tab.set_store(self.store)
+        path = os.path.join(self.tmp, "history.csv")
+        self.tab.export_csv(path)
+        with open(path, encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0], self.tab.COLS)
+
+
+class TestWatchlistDialog(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-rules-")
+        self.path = os.path.join(self.tmp, "watchlist.txt")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_missing_file_opens_on_the_template(self):
+        d = bit.WatchlistDialog(self.path)
+        self.assertIn("BLACK ICE watchlist", d.text())
+        self.assertIn("no problems", d.status.text())
+        d.deleteLater()
+
+    def test_an_existing_file_is_loaded_verbatim(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("# mine\ncidr 203.0.113.0/24 DOCS\n")
+        d = bit.WatchlistDialog(self.path)
+        self.assertIn("# mine", d.text())
+        self.assertIn("1 rule(s)", d.status.text())
+        d.deleteLater()
+
+    def test_a_bad_line_is_named_before_saving(self):
+        d = bit.WatchlistDialog(self.path)
+        d.edit.setPlainText("cidr not-a-network OOPS\nport 22 SSH\n")
+        self.assertIn("line 1", d.status.text())
+        self.assertIn("1 problem", d.status.text())
+        d.deleteLater()
+
+    def test_saving_writes_the_file_and_keeps_comments(self):
+        d = bit.WatchlistDialog(self.path)
+        d.edit.setPlainText("# keep me\nport 3389 RDP")
+        d._save()
+        self.assertTrue(d.saved)
+        with open(self.path, encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("# keep me", body)
+        self.assertTrue(body.endswith("\n"))
+        self.assertEqual(len(bit.RuleSet.load(self.path)), 1)
+        d.deleteLater()
+
+    def test_an_unwritable_path_reports_instead_of_raising(self):
+        d = bit.WatchlistDialog(os.path.join(self.tmp, "nope", "watchlist.txt"))
+        with mock.patch.object(bit.os, "makedirs", side_effect=OSError("denied")):
+            d._save()
+        self.assertFalse(d.saved)
+        self.assertIn("denied", d.status.text())
+        d.deleteLater()
+
+    def test_reload_discards_unsaved_edits(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("port 22 SSH\n")
+        d = bit.WatchlistDialog(self.path)
+        d.edit.setPlainText("garbage")
+        d.reload()
+        self.assertIn("port 22 SSH", d.text())
+        d.deleteLater()
+
+
+class TestNdjsonStream(unittest.TestCase):
+    Addr = collections.namedtuple("Addr", "ip port")
+    Conn = collections.namedtuple("Conn", "fd family type laddr raddr status pid")
+
+    def _args(self, *extra):
+        return bit.build_arg_parser().parse_args(
+            ["--json", "--duration", "0", "--interval", "0"] + list(extra))
+
+    def _conns(self):
+        return [
+            self.Conn(1, 2, 1, self.Addr("0.0.0.0", 0),
+                      self.Addr("203.0.113.9", 443), "ESTABLISHED", None),
+            self.Conn(2, 2, 1, self.Addr("0.0.0.0", 22), (), "LISTEN", None),
+        ]
+
+    def _run(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(bit.psutil, "net_connections", return_value=self._conns()), \
+             mock.patch.object(bit.ProcTrafficSampler, "available", return_value=False), \
+             mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=err):
+            rc = bit.run_headless(self._args(*extra))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_stdout_is_nothing_but_ndjson(self):
+        rc, out, _err = self._run()
+        self.assertEqual(rc, 0)
+        lines = [l for l in out.splitlines() if l.strip()]
+        self.assertTrue(lines)
+        for line in lines:
+            json.loads(line)
+
+    def test_the_human_summary_goes_to_stderr(self):
+        _rc, out, err = self._run()
+        self.assertIn("headless", err)
+        self.assertNotIn("headless", out)
+
+    def test_a_record_carries_contacts_listeners_and_states(self):
+        _rc, out, _err = self._run()
+        record = json.loads(out.splitlines()[0])
+        self.assertEqual(record["pass"], 1)
+        self.assertEqual(record["version"], bit.APP_VERSION)
+        self.assertEqual([c["ip"] for c in record["contacts"]], ["203.0.113.9"])
+        self.assertEqual([l["port"] for l in record["listeners"]], [22])
+        self.assertEqual(record["states"], {"ESTABLISHED": 1, "LISTEN": 1})
+
+    def test_the_first_record_reports_no_port_changes(self):
+        _rc, out, _err = self._run()
+        record = json.loads(out.splitlines()[0])
+        self.assertEqual(record["listeners_opened"], [])
+        self.assertEqual(record["listeners_closed"], [])
+
+    def test_watchlist_hits_are_called_out_in_the_record(self):
+        rules = bit.RuleSet.parse("cidr 203.0.113.0/24 DOCS\n")
+        out = io.StringIO()
+        bit.emit_scan_json(1, [{"ip": "203.0.113.9", "port": 443, "proto": "tcp"}],
+                           [], [], [], {}, {}, rules, stream=out)
+        record = json.loads(out.getvalue())
+        self.assertEqual(record["flagged"],
+                         [{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                           "flags": ["DOCS"]}])
+
+    def test_proc_bytes_are_split_into_rx_and_tx(self):
+        out = io.StringIO()
+        bit.emit_scan_json(1, [], [], [], [], {}, {"firefox": (10, 20)},
+                           bit.RuleSet(), stream=out)
+        record = json.loads(out.getvalue())
+        self.assertEqual(record["proc_bytes"], {"firefox": {"rx": 10, "tx": 20}})
+
+    def test_json_implies_headless(self):
+        args = bit.build_arg_parser().parse_args(["--json"])
+        self.assertFalse(args.headless)
+        with mock.patch.object(bit, "run_headless", return_value=0) as run, \
+             mock.patch.object(bit, "init_geoip"), mock.patch.object(bit, "init_asn"):
+            with self.assertRaises(SystemExit):
+                bit.main(["--json"])
+        self.assertTrue(run.called)
+
+
+class TestMapClustering(unittest.TestCase):
+    def setUp(self):
+        self.w = bit.WorldMapWidget()
+
+    def tearDown(self):
+        self.w.deleteLater()
+        _app.processEvents()
+
+    def _points(self):
+        return [
+            {"proto": "tcp", "ip": "203.0.113.1", "port": 443, "lat": 39.0,
+             "lon": -77.0, "asn": "AS16509 AMAZON"},
+            {"proto": "tcp", "ip": "203.0.113.2", "port": 443, "lat": 39.2,
+             "lon": -77.4, "asn": "AS16509 AMAZON"},
+            {"proto": "tcp", "ip": "203.0.113.3", "port": 443, "lat": 52.5,
+             "lon": 13.4, "asn": "AS3320 DTAG"},
+        ]
+
+    def test_contacts_group_by_owning_network(self):
+        self.w.set_points(self._points())
+        clusters = self.w.clusters()
+        self.assertEqual([(c["key"], c["count"]) for c in clusters],
+                         [("AS16509", 2), ("AS3320", 1)])
+
+    def test_a_cluster_sits_at_the_mean_of_its_members(self):
+        self.w.set_points(self._points())
+        amazon = self.w.clusters()[0]
+        self.assertAlmostEqual(amazon["lat"], 39.1, places=5)
+        self.assertAlmostEqual(amazon["lon"], -77.2, places=5)
+
+    def test_contacts_without_an_asn_fall_back_to_a_geographic_cell(self):
+        self.w.set_points([
+            {"proto": "tcp", "ip": "198.51.100.%d" % i, "port": 80,
+             "lat": 48.1 + i * 0.1, "lon": 16.3, "asn": ""} for i in range(3)])
+        clusters = self.w.clusters()
+        self.assertEqual(len(clusters), 1)
+        self.assertTrue(clusters[0]["key"].startswith("@"))
+        self.assertIn("3 contact(s)", clusters[0]["label"])
+
+    def test_the_label_names_the_network_and_samples_members(self):
+        self.w.set_points(self._points())
+        label = self.w.clusters()[0]["label"]
+        self.assertIn("AS16509 AMAZON", label)
+        self.assertIn("2 contact(s)", label)
+        self.assertIn("203.0.113.1:443", label)
+
+    def test_clustering_switches_off_once_zoomed_in(self):
+        self.assertTrue(self.w.clustering())
+        self.w.zoom = bit.WorldMapWidget.CLUSTER_ZOOM + 0.1
+        self.assertFalse(self.w.clustering())
+
+    def test_the_toggle_wins_over_the_zoom(self):
+        self.w.set_cluster(False)
+        self.assertFalse(self.w.clustering())
+
+    def test_a_bigger_cluster_draws_a_bigger_circle(self):
+        self.assertLess(bit.WorldMapWidget.cluster_radius(2),
+                        bit.WorldMapWidget.cluster_radius(50))
+
+    def test_the_radius_is_capped(self):
+        self.assertLessEqual(bit.WorldMapWidget.cluster_radius(100000), 16.0)
+
+    def test_hover_names_the_cluster_while_clustered(self):
+        self.w.resize(800, 400)
+        self.w.set_points(self._points())
+        cluster = self.w.clusters()[0]
+        x, y = self.w.project(cluster["lon"], cluster["lat"])
+        hit = self.w.point_at(QtCore.QPoint(int(x), int(y)))
+        self.assertIsNotNone(hit)
+        self.assertIn("AS16509", hit["label"])
+
+    def test_painting_a_clustered_map_does_not_raise(self):
+        self.w.resize(400, 300)
+        self.w.set_points(self._points())
+        self.w.set_me({"lat": 50.0, "lon": 8.0})
+        self.w.set_rays(True)
+        self.w.grab()
+
+    def test_the_map_tab_toggle_drives_the_widget(self):
+        tab = bit.MapTab()
+        tab.cluster_enable.setChecked(False)
+        self.assertFalse(tab.world.cluster)
+        tab.cluster_enable.setChecked(True)
+        self.assertTrue(tab.world.cluster)
+        tab.deleteLater()
+
+
+class TestAlertRateLimit(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-alert-")
+        self.w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+            os.path.join(self.tmp, "cfg.ini"), QtCore.QSettings.Format.IniFormat)))
+
+    def tearDown(self):
+        self.w.close()
+        self.w.deleteLater()
+        _app.processEvents()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_same_hit_is_reported_once(self):
+        for _ in range(20):
+            self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.assertEqual(self.w._alerts, 1)
+        self.assertEqual(self.w._alerts_muted, 19)
+
+    def test_the_banner_counts_distinct_endpoints(self):
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._on_alert("203.0.113.10:443", "DOCS")
+        self.assertIn("2 endpoint(s)", self.w.dash.alert_lbl.text())
+
+    def test_muted_repeats_are_disclosed_not_hidden(self):
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._on_alert("203.0.113.10:443", "DOCS")
+        self.assertIn("repeats muted", self.w.dash.alert_lbl.text())
+
+    def test_a_hit_repeats_once_the_window_has_passed(self):
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._alert_seen[("203.0.113.9:443", "DOCS")] -= (
+            self.w.ALERT_REPEAT_SECONDS + 1)
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.assertEqual(self.w._alerts, 2)
+
+    def test_a_new_rule_on_the_same_endpoint_is_new_news(self):
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._on_alert("203.0.113.9:443", "TOR EXIT")
+        self.assertEqual(self.w._alerts, 2)
+
+    def test_a_newly_world_reachable_sensitive_port_raises_the_banner(self):
+        self.w._on_listeners_opened([_listener(port=6379, process="redis-server")])
+        self.assertIn("SENSITIVE PORT", self.w.dash.alert_lbl.text())
+        self.assertIn("PORT OPENED", self.w.dash.log.toPlainText())
+
+    def test_a_loopback_port_opening_is_logged_but_not_alarming(self):
+        self.w._on_listeners_opened([_listener("127.0.0.1", 6379, process="redis-server")])
+        self.assertIn("PORT OPENED", self.w.dash.log.toPlainText())
+        self.assertEqual(self.w._alerts, 0)
+
+    def test_a_closed_port_is_logged(self):
+        self.w._on_listeners_closed([_listener(port=8080, process="python3")])
+        self.assertIn("port closed", self.w.dash.log.toPlainText())
+
+
+# --------------------------------------------------------------------------
+# 0.14.0: per-contact bytes, attribution honesty, socket health, session
+# accounting, per-process baseline, beacon detection, forward-confirmed DNS
+
+
+class TestSplitEndpoint(unittest.TestCase):
+    def test_plain_v4(self):
+        self.assertEqual(bit.split_endpoint("1.2.3.4:443"), ("1.2.3.4", 443))
+
+    def test_bracketed_v6(self):
+        self.assertEqual(bit.split_endpoint("[2001:db8::1]:443"), ("2001:db8::1", 443))
+
+    def test_v4_mapped_onto_a_v6_socket_comes_back_as_v4(self):
+        self.assertEqual(bit.split_endpoint("[::ffff:94.19.200.5]:33008"),
+                         ("94.19.200.5", 33008))
+
+    def test_garbage_does_not_raise(self):
+        for raw in ("", "nonsense", ":", "[unterminated"):
+            self.assertIsInstance(bit.split_endpoint(raw), tuple)
+
+
+class TestPerContactBytes(unittest.TestCase):
+    SS = (
+        'ESTAB 0 0 192.168.1.5:40994 [::ffff:203.0.113.9]:443 '
+        'users:(("firefox",pid=1,fd=9))\n'
+        '\t cubic bytes_sent:100 bytes_received:900\n'
+        'ESTAB 0 0 192.168.1.5:40995 203.0.113.9:443 '
+        'users:(("firefox",pid=1,fd=10))\n'
+        '\t cubic bytes_sent:10 bytes_received:90\n'
+    )
+
+    def _sampler(self):
+        s = bit.ProcTrafficSampler()
+        s.enabled = True
+        with mock.patch.object(s, "_run", return_value=""):
+            s.sample()  # prime, so the next pass counts in full
+        return s
+
+    def test_the_peer_key_matches_a_contact_key(self):
+        self.assertEqual(
+            bit.ProcTrafficSampler.peer_key("192.168.1.5:40994|[::ffff:203.0.113.9]:443"),
+            "tcp:203.0.113.9:443")
+
+    def test_bytes_are_bucketed_by_endpoint(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            s.sample()
+        # Two sockets to the same endpoint, one of them v4-mapped: one bucket.
+        self.assertEqual(s.peer_totals(), {"tcp:203.0.113.9:443": (990, 110)})
+
+    def test_process_and_peer_totals_agree(self):
+        s = self._sampler()
+        with mock.patch.object(s, "_run", return_value=self.SS):
+            totals = s.sample()
+        self.assertEqual(totals["firefox"], (990, 110))
+
+    def test_peer_totals_are_capped(self):
+        s = self._sampler()
+        s.MAX_PEERS = 3
+        rows = "".join(
+            f'ESTAB 0 0 10.0.0.1:{1000 + i} 203.0.113.{i}:443\n'
+            f'\t cubic bytes_sent:{i + 1} bytes_received:{i + 1}\n'
+            for i in range(10))
+        with mock.patch.object(s, "_run", return_value=rows):
+            s.sample()
+        self.assertLessEqual(len(s.peer_totals()), 3)
+
+    def test_the_table_shows_them(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time()}])
+        self.assertEqual(tab.model.item(0, tab.C_RX).text(), "—")
+        tab.set_peer_io({"tcp:203.0.113.9:443": (2048, 1024)})
+        self.assertEqual(tab.model.item(0, tab.C_RX).text(), "2.0 KB")
+        self.assertEqual(tab.model.item(0, tab.C_TX).text(), "1.0 KB")
+        tab.deleteLater()
+
+    def test_byte_cells_sort_numerically_not_alphabetically(self):
+        self.assertLess(bit.ConnectionsTab._bytes_cell(900)[1],
+                        bit.ConnectionsTab._bytes_cell(2048)[1])
+        self.assertEqual(bit.ConnectionsTab._bytes_cell(900)[0], "900.0 B")
+
+    def test_a_figure_survives_the_endpoint_being_seen_again(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        point = {"ip": "203.0.113.9", "port": 443, "proto": "tcp", "ts": time.time()}
+        tab.add_points([point])
+        tab.set_peer_io({"tcp:203.0.113.9:443": (2048, 1024)})
+        tab.add_points([dict(point, ts=time.time() + 30)])
+        self.assertEqual(tab.model.item(0, tab.C_RX).text(), "2.0 KB")
+        tab.deleteLater()
+
+    def test_an_unknown_endpoint_is_ignored(self):
+        tab = bit.ConnectionsTab()
+        tab.set_peer_io({"tcp:198.51.100.1:443": (1, 1)})  # must not raise
+        self.assertEqual(tab.model.rowCount(), 0)
+        tab.deleteLater()
+
+    def test_the_figures_reach_the_json_export(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time()}])
+        tab.set_peer_io({"tcp:203.0.113.9:443": (2048, 1024)})
+        tmp = tempfile.mkdtemp(prefix="blackice-bytes-")
+        try:
+            path = os.path.join(tmp, "c.json")
+            tab.export_json(path)
+            with open(path, encoding="utf-8") as f:
+                rows = json.load(f)
+            self.assertEqual(rows[0]["rx_bytes"], 2048)
+            self.assertEqual(rows[0]["tx_bytes"], 1024)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            tab.deleteLater()
+
+
+class TestAttributionHonesty(unittest.TestCase):
+    Addr = collections.namedtuple("Addr", "ip port")
+    Conn = collections.namedtuple("Conn", "fd family type laddr raddr status pid")
+
+    def test_unprivileged_scope_names_the_blind_spot(self):
+        self.assertEqual(
+            bit.attribution_summary({"remote": 100, "unattributed": 45}),
+            "own processes (45% unattributed)")
+
+    def test_root_sees_everything(self):
+        self.assertEqual(
+            bit.attribution_summary({"remote": 100, "unattributed": 45,
+                                     "elevated": 1}),
+            "all processes (root)")
+
+    def test_nothing_hidden_means_no_parenthetical(self):
+        self.assertEqual(
+            bit.attribution_summary({"remote": 10, "unattributed": 0}),
+            "own processes")
+
+    def test_an_empty_scan_does_not_divide_by_zero(self):
+        self.assertEqual(bit.attribution_summary({}), "own processes")
+
+    def test_the_ratio_covers_the_whole_table_not_just_new_contacts(self):
+        """Counted after the dedupe, the figure jumped around with whatever
+        handful of endpoints happened to be new that scan."""
+        conns = [
+            self.Conn(i, 2, 1, self.Addr("0.0.0.0", 0),
+                      self.Addr("203.0.113.%d" % i, 443), "ESTABLISHED",
+                      None if i % 2 else 7)
+            for i in range(1, 11)]
+        proc = mock.Mock()
+        proc.name.return_value = "curl"
+        scanner = bit.ConnScanner()
+        with mock.patch.object(bit.psutil, "net_connections", return_value=conns), \
+             mock.patch.object(bit.psutil, "Process", return_value=proc):
+            scanner._scan_psutil()
+            first = dict(scanner.scan_stats)
+            scanner._scan_psutil()   # everything deduped away this time
+            second = dict(scanner.scan_stats)
+        self.assertEqual(first["remote"], 10)
+        self.assertEqual(first["unattributed"], 5)
+        self.assertEqual(second, first)
+
+    def test_the_scanner_counts_what_it_could_not_attribute(self):
+        conns = [
+            self.Conn(1, 2, 1, self.Addr("0.0.0.0", 0),
+                      self.Addr("203.0.113.1", 443), "ESTABLISHED", None),
+            self.Conn(2, 2, 1, self.Addr("0.0.0.0", 0),
+                      self.Addr("203.0.113.2", 443), "ESTABLISHED", 7),
+        ]
+        proc = mock.Mock()
+        proc.name.return_value = "curl"
+        scanner = bit.ConnScanner()
+        with mock.patch.object(bit.psutil, "net_connections", return_value=conns), \
+             mock.patch.object(bit.psutil, "Process", return_value=proc):
+            scanner._scan_psutil()
+        self.assertEqual(scanner.scan_stats["remote"], 2)
+        self.assertEqual(scanner.scan_stats["unattributed"], 1)
+
+    def test_the_window_reports_it_once(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-scope-")
+        try:
+            w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+                os.path.join(tmp, "c.ini"), QtCore.QSettings.Format.IniFormat)))
+            w._on_scan_stats({"remote": 100, "unattributed": 45})
+            w._on_scan_stats({"remote": 100, "unattributed": 45})
+            self.assertIn("SCOPE: own processes (45% unattributed)", w.dash.sub.text())
+            log = w.dash.log.toPlainText()
+            self.assertEqual(log.count("have no owning process"), 1)
+            self.assertIn("needs root", log)
+            w.close()
+            w.deleteLater()
+            _app.processEvents()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSocketHealthMonitor(unittest.TestCase):
+    def setUp(self):
+        self.m = bit.SocketHealthMonitor()
+
+    def _feed(self, state, values, now=0.0):
+        """Collect every report across the series — the monitor speaks up as
+        soon as it has grounds to, not only on the last sample."""
+        out = []
+        for v in values:
+            out.extend(self.m.feed({state: v}, now=now))
+        return out
+
+    def test_a_climbing_pile_of_close_wait_is_reported(self):
+        out = self._feed("CLOSE_WAIT", [10, 20, 30, 40, 60])
+        self.assertTrue(out)
+        self.assertIn("CLOSE_WAIT", out[0])
+        self.assertIn("not closing its sockets", out[0])
+
+    def test_a_high_but_flat_level_is_not_news(self):
+        self.assertEqual(self._feed("CLOSE_WAIT", [200] * 6), [])
+
+    def test_a_climb_below_the_threshold_is_not_news(self):
+        self.assertEqual(self._feed("CLOSE_WAIT", [1, 2, 3, 4, 5]), [])
+
+    def test_too_few_samples_to_judge(self):
+        self.assertEqual(self._feed("CLOSE_WAIT", [10, 200]), [])
+
+    def test_syn_sent_explains_itself_differently(self):
+        out = self._feed("SYN_SENT", [1, 4, 9, 14, 30])
+        self.assertIn("not completing", out[0])
+
+    def test_it_does_not_repeat_within_the_window(self):
+        self._feed("CLOSE_WAIT", [10, 20, 30, 40, 60])
+        self.assertEqual(self.m.feed({"CLOSE_WAIT": 80}, now=10.0), [])
+
+    def test_it_speaks_again_once_the_window_passes(self):
+        self._feed("CLOSE_WAIT", [10, 20, 30, 40, 60])
+        later = bit.SocketHealthMonitor.REPEAT_SECONDS + 1
+        self.assertTrue(self.m.feed({"CLOSE_WAIT": 90}, now=later))
+
+    def test_ordinary_states_are_never_reported(self):
+        self.assertEqual(self._feed("TIME_WAIT", [10, 500, 2000, 9000, 20000]), [])
+
+
+class TestSessionAccounting(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-sessions-")
+        self.path = os.path.join(self.tmp, "history.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_run_is_recorded_and_read_back(self):
+        store = bit.SessionStore(self.path)
+        store.open()
+        store.close()
+        store.open()
+        summary = store.sessions_summary()
+        self.assertEqual(summary["sessions"], 2)
+        self.assertGreater(summary["first"], 0)
+        store.close()
+
+    def test_watched_time_accumulates(self):
+        store = bit.SessionStore(self.path)
+        store.open()
+        store.touch_session(store._session_started + 3600)
+        self.assertAlmostEqual(store.sessions_summary()["watched"], 3600, places=0)
+        store.close()
+
+    def test_a_killed_run_still_counts_what_it_watched(self):
+        store = bit.SessionStore(self.path)
+        store.open()
+        store.touch_session(store._session_started + 120)
+        store._db.close()          # killed: no clean close
+        store._db = None
+        reopened = bit.SessionStore(self.path)
+        reopened.open()
+        self.assertGreaterEqual(reopened.sessions_summary()["watched"], 120)
+        reopened.close()
+
+    def test_a_pre_migration_database_is_upgraded_in_place(self):
+        db = sqlite3.connect(self.path)
+        db.execute("CREATE TABLE sessions (started REAL PRIMARY KEY, version TEXT)")
+        db.execute("INSERT INTO sessions VALUES (1000.0, '0.12.0')")
+        db.commit()
+        db.close()
+        store = bit.SessionStore(self.path)
+        self.assertTrue(store.open())
+        self.assertEqual(store.sessions_summary()["sessions"], 2)
+        store.close()
+
+    def test_an_empty_database_reports_zeroes(self):
+        store = bit.SessionStore(self.path)
+        self.assertEqual(store.sessions_summary(),
+                         {"sessions": 0, "first": 0.0, "watched": 0.0})
+
+    def test_durations_read_in_a_sensible_unit(self):
+        self.assertEqual(bit.human_duration(42), "42s")
+        self.assertEqual(bit.human_duration(300), "5m")
+        self.assertEqual(bit.human_duration(5400), "1.5h")
+        self.assertEqual(bit.human_duration(172800), "2.0d")
+
+    def test_the_history_tab_shows_it(self):
+        store = bit.SessionStore(self.path)
+        store.open()
+        store.touch_session(store._session_started + 7200)
+        tab = bit.HistoryTab(store)
+        self.assertIn("watched 2.0h across 1 session(s)", tab.summary.text())
+        tab.deleteLater()
+        store.close()
+
+
+class TestProcessBaseline(unittest.TestCase):
+    def _baseline(self, hits=100):
+        return bit.ProcessBaseline({
+            "firefox": {"asn": {"AS13335", "AS16509"}, "country": {"US", "DE"},
+                        "hits": hits}})
+
+    def test_a_familiar_network_is_unremarkable(self):
+        b = self._baseline()
+        self.assertEqual(b.judge({"ip": "8.8.8.8", "process": "firefox",
+                                  "asn": "AS13335 CLOUDFLARE", "country": "US"}), [])
+
+    def test_an_unfamiliar_asn_for_that_process_is_flagged(self):
+        b = self._baseline()
+        hits = b.judge({"ip": "8.8.8.8", "process": "firefox",
+                        "asn": "AS12345 SOMETHING", "country": "US"})
+        self.assertEqual(hits, ["AS12345 NEW FOR firefox"])
+
+    def test_an_unfamiliar_country_is_flagged_too(self):
+        b = self._baseline()
+        hits = b.judge({"ip": "8.8.8.8", "process": "firefox",
+                        "asn": "AS13335 CLOUDFLARE", "country": "BY"})
+        self.assertEqual(hits, ["BY NEW FOR firefox"])
+
+    def test_a_process_with_too_little_history_is_not_judged(self):
+        b = self._baseline(hits=3)
+        self.assertEqual(b.judge({"ip": "8.8.8.8", "process": "firefox",
+                                  "asn": "AS12345 X", "country": "BY"}), [])
+
+    def test_an_unknown_process_is_not_judged(self):
+        b = self._baseline()
+        self.assertEqual(b.judge({"ip": "8.8.8.8", "process": "curl",
+                                  "asn": "AS12345 X"}), [])
+
+    def test_the_lan_is_not_a_behavioural_signal(self):
+        b = self._baseline()
+        self.assertEqual(b.judge({"ip": "192.168.1.5", "process": "firefox",
+                                  "asn": "AS12345 X", "country": "BY"}), [])
+
+    def test_the_org_string_is_not_the_identity(self):
+        self.assertEqual(bit.ProcessBaseline.asn_number("AS13335 CLOUDFLARE, INC."),
+                         "AS13335")
+        self.assertEqual(bit.ProcessBaseline.asn_number("no number here"), "")
+
+    def test_profiles_are_learned_from_the_database(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-profile-")
+        try:
+            store = bit.SessionStore(os.path.join(tmp, "h.db"))
+            store.open()
+            now = time.time()
+            store.record_contacts([
+                {"ip": "8.8.8.%d" % i, "port": 443, "proto": "tcp", "ts": now,
+                 "process": "firefox", "asn": "AS13335 CLOUDFLARE", "country": "US"}
+                for i in range(30)])
+            profiles = store.process_profiles()
+            self.assertEqual(profiles["firefox"]["asn"], {"AS13335"})
+            self.assertEqual(profiles["firefox"]["country"], {"US"})
+            self.assertGreaterEqual(profiles["firefox"]["hits"], 30)
+            store.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_table_flags_and_colours_an_anomaly(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.set_process_baseline(self._baseline())
+        tab.add_points([{"ip": "8.8.8.8", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "process": "firefox",
+                         "asn": "AS12345 X", "country": "BY"}])
+        self.assertIn("⚠AS12345 NEW FOR firefox",
+                      tab.model.item(0, tab.C_FLAGS).text())
+        self.assertEqual(tab.model.item(0, tab.C_IP).foreground().color().name(),
+                         bit.AMBER.name())
+        tab.deleteLater()
+
+    def test_applying_a_baseline_is_retroactive(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "8.8.8.8", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "process": "firefox",
+                         "asn": "AS12345 X", "country": "BY"}])
+        self.assertEqual(tab.model.item(0, tab.C_FLAGS).text(), "")
+        tab.set_process_baseline(self._baseline())
+        self.assertIn("NEW FOR firefox", tab.model.item(0, tab.C_FLAGS).text())
+        tab.deleteLater()
+
+    def test_an_anomaly_is_announced_once_not_every_scan(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.set_process_baseline(self._baseline())
+        seen = []
+        tab.anomalyNoticed.connect(lambda e, l: seen.append((e, l)))
+        point = {"ip": "8.8.8.8", "port": 443, "proto": "tcp",
+                 "ts": time.time(), "process": "firefox", "asn": "AS12345 X"}
+        for i in range(5):
+            tab.add_points([dict(point, ts=time.time() + i * 20)])
+        self.assertEqual(len(seen), 1)
+        self.assertIn("AS12345 NEW FOR firefox", seen[0][1])
+        tab.deleteLater()
+
+    def test_a_watchlist_hit_still_outranks_an_anomaly_in_colour(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.set_process_baseline(self._baseline())
+        tab.set_rules(bit.RuleSet.parse("cidr 8.8.8.0/24 GOOGLE DNS\n"))
+        tab.add_points([{"ip": "8.8.8.8", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "process": "firefox",
+                         "asn": "AS12345 X"}])
+        self.assertEqual(tab.model.item(0, tab.C_IP).foreground().color().name(),
+                         bit.RED.name())
+        tab.deleteLater()
+
+
+class TestBeaconDetector(unittest.TestCase):
+    def _series(self, detector, gaps, start=1000.0):
+        t = start
+        detector.observe("k", t)
+        for g in gaps:
+            t += g
+            detector.observe("k", t)
+
+    def test_a_steady_rhythm_is_measured(self):
+        d = bit.BeaconDetector()
+        self._series(d, [300.0] * 9)
+        verdict = d.verdict("k")
+        self.assertAlmostEqual(verdict["period"], 300.0, places=3)
+        self.assertEqual(verdict["samples"], 10)
+        self.assertIn("BEACON ~300s", bit.BeaconDetector.describe(verdict))
+
+    def test_irregular_traffic_is_not_a_beacon(self):
+        d = bit.BeaconDetector()
+        self._series(d, [120, 480, 150, 420, 200, 390, 130, 470, 160])
+        self.assertIsNone(d.verdict("k"))
+
+    def test_too_few_sightings_to_say(self):
+        d = bit.BeaconDetector()
+        self._series(d, [300.0] * 3)
+        self.assertIsNone(d.verdict("k"))
+
+    def test_a_persistently_open_connection_is_not_reported(self):
+        # The scanner re-emits an unbroken connection every ~20s, which is a
+        # perfect rhythm that means nothing at all.
+        d = bit.BeaconDetector()
+        self._series(d, [20.0] * 12)
+        self.assertIsNone(d.verdict("k"))
+
+    def test_a_slow_beacon_survives_a_little_jitter(self):
+        d = bit.BeaconDetector()
+        self._series(d, [300, 302, 298, 301, 299, 300, 303, 297, 300])
+        self.assertIsNotNone(d.verdict("k"))
+
+    def test_duplicate_timestamps_are_ignored(self):
+        d = bit.BeaconDetector()
+        for _ in range(10):
+            d.observe("k", 1000.0)
+        self.assertIsNone(d.verdict("k"))
+
+    def test_an_unseen_key_has_no_verdict(self):
+        self.assertIsNone(bit.BeaconDetector().verdict("nope"))
+
+    def test_tracking_is_bounded(self):
+        d = bit.BeaconDetector()
+        d.MAX_TRACKED = 5
+        for i in range(50):
+            d.observe("k%d" % i, 1000.0 + i)
+        self.assertLessEqual(len(d._events), 5)
+
+    def test_beacons_lists_only_the_rhythmic_ones(self):
+        d = bit.BeaconDetector()
+        self._series(d, [300.0] * 9)
+        t = 1000.0
+        for g in [10, 900, 20, 700]:
+            t += g
+            d.observe("noisy", t)
+        self.assertEqual([k for k, _v in d.beacons()], ["k"])
+
+    def test_the_table_flags_a_beacon(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        base = time.time()
+        for i in range(8):
+            tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                             "ts": base + i * 300}])
+        self.assertIn("◷BEACON ~300s", tab.model.item(0, tab.C_FLAGS).text())
+        tab.deleteLater()
+
+
+class TestForwardConfirmedDns(unittest.TestCase):
+    def test_a_name_that_resolves_back_is_confirmed(self):
+        infos = [(2, 1, 6, "", ("203.0.113.9", 0))]
+        with mock.patch.object(bit.socket, "getaddrinfo", return_value=infos):
+            self.assertTrue(bit.RDnsResolver._confirm("203.0.113.9", "a.example"))
+
+    def test_an_anycast_name_with_several_addresses_still_confirms(self):
+        infos = [(2, 1, 6, "", ("1.0.0.1", 0)), (2, 1, 6, "", ("1.1.1.1", 0))]
+        with mock.patch.object(bit.socket, "getaddrinfo", return_value=infos):
+            self.assertTrue(bit.RDnsResolver._confirm("1.1.1.1", "one.one.one.one"))
+
+    def test_a_name_that_points_elsewhere_is_not_confirmed(self):
+        infos = [(2, 1, 6, "", ("198.51.100.1", 0))]
+        with mock.patch.object(bit.socket, "getaddrinfo", return_value=infos):
+            self.assertFalse(bit.RDnsResolver._confirm("203.0.113.9", "liar.example"))
+
+    def test_a_v4_mapped_answer_still_matches(self):
+        infos = [(10, 1, 6, "", ("::ffff:203.0.113.9", 0, 0, 0))]
+        with mock.patch.object(bit.socket, "getaddrinfo", return_value=infos):
+            self.assertTrue(bit.RDnsResolver._confirm("203.0.113.9", "a.example"))
+
+    def test_a_failed_forward_lookup_is_not_a_confirmation(self):
+        with mock.patch.object(bit.socket, "getaddrinfo",
+                               side_effect=socket.gaierror):
+            self.assertFalse(bit.RDnsResolver._confirm("203.0.113.9", "a.example"))
+
+    def test_nothing_to_check_is_not_a_confirmation(self):
+        self.assertFalse(bit.RDnsResolver._confirm("203.0.113.9", ""))
+
+    def test_the_table_flags_an_unconfirmed_name(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "host": "liar.example"}])
+        self.assertEqual(tab.model.item(0, tab.C_FLAGS).text(), "")
+        tab.set_fcrdns("203.0.113.9", False)
+        self.assertIn(bit.ConnectionsTab.FLAG_UNCONFIRMED,
+                      tab.model.item(0, tab.C_FLAGS).text())
+        tab.deleteLater()
+
+    def test_a_confirmed_name_carries_no_flag(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time(), "host": "honest.example"}])
+        tab.set_fcrdns("203.0.113.9", True)
+        self.assertEqual(tab.model.item(0, tab.C_FLAGS).text(), "")
+        tab.deleteLater()
+
+    def test_an_address_with_no_name_is_never_flagged(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([{"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                         "ts": time.time()}])
+        tab.set_fcrdns("203.0.113.9", False)
+        self.assertEqual(tab.model.item(0, tab.C_FLAGS).text(), "")
+        tab.deleteLater()
+
+    def test_the_verdict_sticks_when_the_endpoint_is_seen_again(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        point = {"ip": "203.0.113.9", "port": 443, "proto": "tcp",
+                 "ts": time.time(), "host": "liar.example"}
+        tab.add_points([point])
+        tab.set_fcrdns("203.0.113.9", False)
+        tab.add_points([dict(point, ts=time.time() + 30)])
+        self.assertIn(bit.ConnectionsTab.FLAG_UNCONFIRMED,
+                      tab.model.item(0, tab.C_FLAGS).text())
+        tab.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# 0.15.0: tray, --watch, freeze, scan interval, drill-down, firewall rules
+
+
+class TestFirewallRules(unittest.TestCase):
+    def test_nftables_v4(self):
+        self.assertEqual(
+            bit.firewall_rule("nftables", "203.0.113.9", 443, "tcp"),
+            "nft add rule inet filter output ip daddr 203.0.113.9 "
+            "tcp dport 443 counter drop")
+
+    def test_nftables_switches_family_for_v6(self):
+        self.assertIn("ip6 daddr 2001:db8::1",
+                      bit.firewall_rule("nftables", "2001:db8::1", 443))
+
+    def test_iptables_v4(self):
+        self.assertEqual(
+            bit.firewall_rule("iptables", "203.0.113.9", 443, "tcp"),
+            "iptables -A OUTPUT -p tcp -d 203.0.113.9 --dport 443 -j DROP")
+
+    def test_iptables_switches_binary_for_v6(self):
+        self.assertTrue(
+            bit.firewall_rule("iptables", "2001:db8::1", 53, "udp")
+            .startswith("ip6tables "))
+
+    def test_ufw_v4(self):
+        self.assertEqual(bit.firewall_rule("ufw", "203.0.113.9", 443, "tcp"),
+                         "ufw deny out to 203.0.113.9 port 443 proto tcp")
+
+    def test_no_port_means_the_whole_host(self):
+        self.assertEqual(bit.firewall_rule("ufw", "203.0.113.9"),
+                         "ufw deny out to 203.0.113.9")
+        self.assertNotIn("dport", bit.firewall_rule("nftables", "203.0.113.9"))
+
+    def test_udp_is_carried_through(self):
+        self.assertIn("proto udp", bit.firewall_rule("ufw", "203.0.113.9", 53, "udp"))
+
+    def test_a_v4_mapped_address_is_normalised(self):
+        self.assertIn("203.0.113.9",
+                      bit.firewall_rule("ufw", "::ffff:203.0.113.9", 443))
+
+    def test_an_unparseable_address_yields_no_rule(self):
+        for syntax in bit.FIREWALL_SYNTAXES:
+            self.assertEqual(bit.firewall_rule(syntax, "not-an-ip", 443), "")
+
+    def test_an_unknown_syntax_yields_no_rule(self):
+        self.assertEqual(bit.firewall_rule("pf", "203.0.113.9", 443), "")
+
+    def test_the_context_menu_offers_every_syntax(self):
+        tab = bit.ConnectionsTab()
+        menu = tab.build_menu(_contact())
+        labels = []
+        for action in menu.actions():
+            if action.menu():
+                labels = [a.text() for a in action.menu().actions()]
+        self.assertEqual(len(labels), len(bit.FIREWALL_SYNTAXES))
+        self.assertTrue(any(l.startswith("nftables: nft add rule") for l in labels))
+        tab.deleteLater()
+
+
+class TestFreezeView(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-freeze-")
+        self.w = bit.MainWindow(
+            config=bit.AppConfig(QtCore.QSettings(
+                os.path.join(self.tmp, "c.ini"), QtCore.QSettings.Format.IniFormat)),
+            store=bit.SessionStore(os.path.join(self.tmp, "h.db")))
+
+    def tearDown(self):
+        self.w.close()
+        self.w.deleteLater()
+        _app.processEvents()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_table_stops_moving(self):
+        self.w.dash.freeze_btn.setChecked(True)
+        self.w._on_points([_contact(ip="8.8.8.8")])
+        self.assertEqual(self.w.conns.model.rowCount(), 0)
+
+    def test_and_moves_again_on_release(self):
+        self.w.dash.freeze_btn.setChecked(True)
+        self.w._on_points([_contact(ip="8.8.8.8")])
+        self.w.dash.freeze_btn.setChecked(False)
+        self.w._on_points([_contact(ip="8.8.8.8")])
+        self.assertEqual(self.w.conns.model.rowCount(), 1)
+
+    def test_recording_carries_on_underneath(self):
+        self.w.dash.history_btn.setChecked(True)
+        self.w.dash.freeze_btn.setChecked(True)
+        self.w._on_points([_contact(ip="8.8.8.8")])
+        self.assertEqual(self.w.store.counts()[0], 1)
+
+    def test_the_rhythm_detector_is_still_fed(self):
+        # A gap caused by the user holding the view still would otherwise
+        # destroy a beacon measurement.
+        self.w.dash.freeze_btn.setChecked(True)
+        base = time.time()
+        for i in range(8):
+            self.w._on_points([_contact(ip="8.8.8.8", ts=base + i * 300)])
+        self.assertIsNotNone(self.w.conns.beacons.verdict("tcp:8.8.8.8:443"))
+
+    def test_socket_health_is_still_measured(self):
+        self.w.dash.freeze_btn.setChecked(True)
+        for n in (10, 20, 30, 40, 60):
+            self.w._on_states({"CLOSE_WAIT": n})
+        self.assertIn("CLOSE_WAIT", self.w.dash.log.toPlainText())
+
+    def test_listeners_opened_during_a_freeze_are_reported_on_release(self):
+        self.w._on_listeners([_listener(port=22)])
+        self.w.dash.freeze_btn.setChecked(True)
+        self.w._on_listeners([_listener(port=22), _listener(port=6379)])
+        self.assertNotIn("PORT OPENED", self.w.dash.log.toPlainText())
+        self.w.dash.freeze_btn.setChecked(False)
+        self.w._on_listeners([_listener(port=22), _listener(port=6379)])
+        self.assertIn("PORT OPENED", self.w.dash.log.toPlainText())
+
+    def test_the_status_line_says_so(self):
+        self.w.dash.freeze_btn.setChecked(True)
+        self.assertIn("VIEW: FROZEN", self.w.dash.sub.text())
+        self.w.dash.freeze_btn.setChecked(False)
+        self.assertIn("VIEW: LIVE", self.w.dash.sub.text())
+
+    def test_freeze_is_not_restored_on_the_next_run(self):
+        self.w.dash.config_btn.setChecked(True)
+        self.w.dash.freeze_btn.setChecked(True)
+        self.w.save_state()
+        self.assertIsNone(self.w.cfg.get("dash/frozen", None))
+
+
+class TestScanInterval(unittest.TestCase):
+    def test_the_scanner_accepts_a_new_cadence(self):
+        scanner = bit.ConnScanner(interval=3.0)
+        scanner.set_interval(30.0)
+        self.assertEqual(scanner.interval, 30.0)
+
+    def test_a_silly_interval_is_clamped(self):
+        scanner = bit.ConnScanner()
+        scanner.set_interval(0.0)
+        self.assertGreaterEqual(scanner.interval, 0.2)
+
+    def test_the_poller_accepts_one_too(self):
+        poller = bit.TrafficPoller()
+        poller.set_interval(5.0)
+        self.assertEqual(poller.interval, 5.0)
+
+    def test_the_combo_offers_the_documented_choices(self):
+        d = bit.BlackIceDashboard()
+        self.assertEqual(
+            [d.scan_combo.itemData(i) for i in range(d.scan_combo.count())],
+            list(bit.BlackIceDashboard.SCAN_INTERVALS))
+        self.assertEqual(d.scan_interval(), 3.0)
+        d.deleteLater()
+
+    def test_setting_it_back_does_not_re_emit(self):
+        d = bit.BlackIceDashboard()
+        seen = []
+        d.scanIntervalChanged.connect(seen.append)
+        d.set_scan_interval(10.0)
+        self.assertEqual(d.scan_interval(), 10.0)
+        self.assertEqual(seen, [])
+        d.deleteLater()
+
+    def test_choosing_one_reaches_the_scanner(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-interval-")
+        try:
+            w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+                os.path.join(tmp, "c.ini"), QtCore.QSettings.Format.IniFormat)))
+            w.dash.set_scan_interval(3.0)
+            w.dash.scan_combo.setCurrentIndex(
+                list(bit.BlackIceDashboard.SCAN_INTERVALS).index(10.0))
+            self.assertEqual(w.scanner.interval, 10.0)
+            w.close()
+            w.deleteLater()
+            _app.processEvents()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestDrillDown(unittest.TestCase):
+    def test_a_bar_is_found_under_its_own_pixels(self):
+        panel = bit.RollupPanel("T")
+        panel.resize(300, 140)
+        panel.set_rows([("firefox", 10), ("curl", 5)])
+        self.assertEqual(panel.row_at(QtCore.QPoint(50, panel.ROW_TOP + 2)), "firefox")
+        self.assertEqual(
+            panel.row_at(QtCore.QPoint(50, panel.ROW_TOP + panel.ROW_STEP + 2)), "curl")
+        panel.deleteLater()
+
+    def test_the_gap_between_bars_is_not_a_bar(self):
+        panel = bit.RollupPanel("T")
+        panel.resize(300, 140)
+        panel.set_rows([("firefox", 10), ("curl", 5)])
+        gap = panel.ROW_TOP + panel.ROW_H + 1
+        self.assertIsNone(panel.row_at(QtCore.QPoint(50, gap)))
+        panel.deleteLater()
+
+    def test_clicking_past_the_last_bar_finds_nothing(self):
+        panel = bit.RollupPanel("T")
+        panel.resize(300, 140)
+        panel.set_rows([("firefox", 10)])
+        self.assertIsNone(panel.row_at(QtCore.QPoint(50, 130)))
+        self.assertIsNone(panel.row_at(QtCore.QPoint(50, 0)))
+        panel.deleteLater()
+
+    def test_stats_reports_which_rollup_was_clicked(self):
+        tab = bit.StatsTab()
+        seen = []
+        tab.drillDown.connect(lambda f, v: seen.append((f, v)))
+        tab.proc_panel.rowActivated.emit("firefox")
+        tab.asn_panel.rowActivated.emit("AS13335 CLOUDFLARE")
+        self.assertEqual(seen, [("process", "firefox"),
+                                ("asn", "AS13335 CLOUDFLARE")])
+        tab.deleteLater()
+
+    def test_filtering_to_a_column_ignores_matches_elsewhere(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([_contact(ip="8.8.8.8", process="curl"),
+                        _contact(ip="1.1.1.1", port=80, process="firefox",
+                                 host="curl.example")])
+        tab.filter_to("curl", tab.C_PROCESS)
+        self.assertEqual(tab.proxy.rowCount(), 1)
+        tab.deleteLater()
+
+    def test_a_country_code_matches_as_a_whole_word(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([_contact(ip="8.8.8.8", location="Dresden DE"),
+                        _contact(ip="1.1.1.1", port=80, location="Delhi IN")])
+        tab.filter_to("DE", tab.C_LOCATION, whole_word=True)
+        self.assertEqual(tab.proxy.rowCount(), 1)
+        tab.deleteLater()
+
+    def test_typing_in_the_box_searches_every_column_again(self):
+        tab = bit.ConnectionsTab()
+        tab.resolve_hosts = False
+        tab.add_points([_contact(ip="8.8.8.8", process="curl")])
+        tab.filter_to("curl", tab.C_PROCESS)
+        tab.filter_edit.setText("8.8.8.8")
+        self.assertEqual(tab.proxy.filterKeyColumn(), -1)
+        self.assertEqual(tab.proxy.rowCount(), 1)
+        tab.deleteLater()
+
+    def test_the_window_switches_to_the_contacts_tab(self):
+        tmp = tempfile.mkdtemp(prefix="blackice-drill-")
+        try:
+            w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+                os.path.join(tmp, "c.ini"), QtCore.QSettings.Format.IniFormat)))
+            w.tabs.setCurrentWidget(w.stats)
+            w.stats.drillDown.emit("process", "firefox")
+            self.assertIs(w.tabs.currentWidget(), w.conns)
+            self.assertEqual(w.conns.filter_edit.text(), "firefox")
+            self.assertEqual(w.conns.proxy.filterKeyColumn(),
+                             bit.ConnectionsTab.C_PROCESS)
+            w.close()
+            w.deleteLater()
+            _app.processEvents()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestTray(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="blackice-tray-")
+        self.w = bit.MainWindow(config=bit.AppConfig(QtCore.QSettings(
+            os.path.join(self.tmp, "c.ini"), QtCore.QSettings.Format.IniFormat)))
+
+    def tearDown(self):
+        self.w._quitting = True
+        self.w.close()
+        self.w.deleteLater()
+        _app.processEvents()
+        QtWidgets.QApplication.instance().setQuitOnLastWindowClosed(True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_icon_is_always_produced(self):
+        self.assertFalse(bit.tray_icon().isNull())
+        self.assertFalse(bit.tray_icon(alert=True).isNull())
+
+    def test_an_alert_icon_differs_from_the_quiet_one(self):
+        quiet = bit.tray_icon(False).pixmap(32, 32).toImage()
+        loud = bit.tray_icon(True).pixmap(32, 32).toImage()
+        self.assertNotEqual(quiet, loud)
+
+    def test_it_declines_politely_without_a_system_tray(self):
+        with mock.patch.object(QtWidgets.QSystemTrayIcon,
+                               "isSystemTrayAvailable", return_value=False):
+            self.w.dash.tray_btn.setChecked(True)
+        self.assertIsNone(self.w.tray)
+        self.assertFalse(self.w.dash.tray_btn.isChecked())
+        self.assertIn("no system tray", self.w.dash.log.toPlainText())
+
+    def _enable(self):
+        with mock.patch.object(QtWidgets.QSystemTrayIcon,
+                               "isSystemTrayAvailable", return_value=True):
+            self.w.dash.tray_btn.setChecked(True)
+
+    def test_enabling_it_creates_the_icon(self):
+        self._enable()
+        self.assertIsNotNone(self.w.tray)
+        self.assertFalse(
+            QtWidgets.QApplication.instance().quitOnLastWindowClosed())
+
+    def test_closing_the_window_hides_it_instead_of_quitting(self):
+        self._enable()
+        self.w.show()
+        self.w.close()
+        self.assertTrue(self.w.isHidden())
+        self.assertTrue(self.w.scanner.isRunning())
+
+    def test_quitting_from_the_tray_really_stops(self):
+        self._enable()
+        with mock.patch.object(QtWidgets.QApplication, "quit"):
+            self.w._tray_quit()
+        self.assertIsNone(self.w.tray)
+        self.assertFalse(self.w.scanner.isRunning())
+
+    def test_turning_it_off_restores_ordinary_closing(self):
+        self._enable()
+        self.w.dash.tray_btn.setChecked(False)
+        self.assertIsNone(self.w.tray)
+        self.assertTrue(
+            QtWidgets.QApplication.instance().quitOnLastWindowClosed())
+
+    def test_the_tooltip_counts_what_is_flagged(self):
+        self._enable()
+        self.w._on_alert("203.0.113.9:443", "DOCS")
+        self.w._refresh_tray()
+        self.assertIn("1 flagged", self.w.tray.toolTip())
+
+    def test_the_preference_is_remembered(self):
+        self.w.dash.config_btn.setChecked(True)
+        self._enable()
+        self.w.save_state()
+        self.assertTrue(self.w.cfg.get("window/tray", False, bool))
+
+
+class TestWatchMode(unittest.TestCase):
+    Addr = collections.namedtuple("Addr", "ip port")
+    Conn = collections.namedtuple("Conn", "fd family type laddr raddr status pid")
+
+    def _args(self, *extra):
+        return bit.build_arg_parser().parse_args(
+            ["--watch", "--duration", "0.01", "--interval", "0"] + list(extra))
+
+    def _run(self, conns, rules_text="", notify=False):
+        tmp = tempfile.mkdtemp(prefix="blackice-watch-")
+        try:
+            wl = os.path.join(tmp, "w.txt")
+            with open(wl, "w", encoding="utf-8") as f:
+                f.write(rules_text)
+            out, err = io.StringIO(), io.StringIO()
+            extra = ["--watchlist", wl] + (["--notify"] if notify else [])
+            with mock.patch.object(bit.psutil, "net_connections", return_value=conns), \
+                 mock.patch.object(bit.ProcTrafficSampler, "available",
+                                   return_value=False), \
+                 mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=err):
+                rc = bit.run_headless(self._args(*extra))
+            return rc, out.getvalue() + err.getvalue()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _contact_conn(self):
+        return self.Conn(1, 2, 1, self.Addr("0.0.0.0", 0),
+                         self.Addr("8.8.8.8", 443), "ESTABLISHED", None)
+
+    def test_a_quiet_scan_exits_zero(self):
+        rc, text = self._run([self._contact_conn()])
+        self.assertEqual(rc, bit.EXIT_OK)
+        self.assertIn("nothing flagged", text)
+
+    def test_a_watchlist_hit_sets_its_own_code(self):
+        rc, text = self._run([self._contact_conn()], "cidr 8.8.8.0/24 GOOGLE\n")
+        self.assertEqual(rc, bit.EXIT_WATCHLIST)
+        self.assertIn("WATCHLIST", text)
+
+    def test_the_codes_are_distinct_and_documented(self):
+        self.assertEqual(
+            sorted({bit.EXIT_OK, bit.EXIT_ERROR, bit.EXIT_WATCHLIST,
+                    bit.EXIT_EXPOSURE}),
+            [0, 2, 3, 4])
+
+    def test_an_exposed_port_outranks_a_watchlist_hit(self):
+        rules = bit.RuleSet.parse("cidr 8.8.8.0/24 GOOGLE\n")
+        out = io.StringIO()
+        verdict = bit._watch_report(
+            [{"ip": "8.8.8.8", "port": 443}],
+            [_listener(port=6379, process="redis-server")],
+            rules, False, out)
+        self.assertEqual(verdict, bit.EXIT_EXPOSURE)
+        self.assertIn("EXPOSURE", out.getvalue())
+        self.assertIn("WATCHLIST", out.getvalue())
+
+    def test_a_harmless_new_port_is_not_an_exposure(self):
+        out = io.StringIO()
+        verdict = bit._watch_report([], [_listener(port=8080, process="python3")],
+                                    bit.RuleSet(), False, out)
+        self.assertEqual(verdict, bit.EXIT_OK)
+
+    def test_a_loopback_port_is_not_an_exposure(self):
+        out = io.StringIO()
+        verdict = bit._watch_report(
+            [], [_listener("127.0.0.1", 6379, process="redis-server")],
+            bit.RuleSet(), False, out)
+        self.assertEqual(verdict, bit.EXIT_OK)
+
+    def test_it_notifies_when_asked(self):
+        out = io.StringIO()
+        with mock.patch.object(bit, "notify", return_value=True) as sent:
+            bit._watch_report([], [_listener(port=6379, process="redis-server")],
+                              bit.RuleSet(), True, out)
+        self.assertTrue(sent.called)
+        self.assertIn("port exposed", sent.call_args[0][0])
+
+    def test_it_stays_quiet_when_not_asked(self):
+        out = io.StringIO()
+        with mock.patch.object(bit, "notify") as sent:
+            bit._watch_report([], [_listener(port=6379, process="redis-server")],
+                              bit.RuleSet(), False, out)
+        self.assertFalse(sent.called)
+
+    def test_notify_without_notify_send_is_not_an_error(self):
+        with mock.patch.object(bit.shutil, "which", return_value=None):
+            self.assertFalse(bit.notify("t", "b"))
+
+    def test_notify_survives_a_broken_notify_send(self):
+        with mock.patch.object(bit.shutil, "which", return_value="/usr/bin/notify-send"), \
+             mock.patch.object(bit.subprocess, "run", side_effect=OSError):
+            self.assertFalse(bit.notify("t", "b"))
+
+    def test_watch_implies_headless(self):
+        with mock.patch.object(bit, "run_headless", return_value=0) as run, \
+             mock.patch.object(bit, "init_geoip"), mock.patch.object(bit, "init_asn"):
+            with self.assertRaises(SystemExit):
+                bit.main(["--watch", "--duration", "0"])
+        self.assertTrue(run.called)
 
 
 if __name__ == "__main__":

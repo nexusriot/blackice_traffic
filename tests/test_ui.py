@@ -207,12 +207,32 @@ class TestMapTabLocate(unittest.TestCase):
 
 class TestLeafletBridge(unittest.TestCase):
     def test_js_api_exports_focus_and_clear(self):
+        page, _vendored = bit.leaflet_html()
         for fn in ("clearMe", "focusMe", "setMyLocation", "upsertPoints"):
-            self.assertIn(fn, bit.LEAFLET_HTML)
+            self.assertIn(fn, page)
         self.assertIn(
             "window.BLACKICE = { upsertPoints, setMyLocation, redrawRays, clearRays, clearMe, focusMe }",
-            bit.LEAFLET_HTML,
+            page,
         )
+
+    def test_leaflet_is_inlined_from_the_vendored_copy(self):
+        page, vendored = bit.leaflet_html()
+        self.assertTrue(vendored, "resources/leaflet is missing from the checkout")
+        self.assertNotIn(bit.LEAFLET_CDN, page)
+        self.assertIn("Leaflet 1.9.4", page)       # the library's own banner
+        self.assertIn(".leaflet-pane", page)       # and its stylesheet
+
+    def test_it_falls_back_to_the_cdn_when_the_copy_is_missing(self):
+        with mock.patch.object(bit, "_leaflet_asset", return_value=None):
+            page, vendored = bit.leaflet_html()
+        self.assertFalse(vendored)
+        self.assertIn(bit.LEAFLET_CDN + "leaflet.js", page)
+
+    def test_the_vendored_licence_ships_with_it(self):
+        path = bit.resource_path(os.path.join("leaflet", "LICENSE"))
+        self.assertIsNotNone(path)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("BSD 2-Clause", f.read())
 
 
 class TestConnScannerDedupe(unittest.TestCase):

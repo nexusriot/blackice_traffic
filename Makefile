@@ -1,10 +1,12 @@
 VERSION := $(shell sed -n 's/^APP_VERSION *= *"\(.*\)".*/\1/p' blackice_traffic.py)
 HOST_ARCH := $(shell dpkg --print-architecture 2>/dev/null || uname -m)
 
-.PHONY: all venv bin deb deb-amd64 deb-arm64 clean distclean help
+.PHONY: all venv bin deb deb-amd64 deb-arm64 test test-e2e clean distclean help
 
 help:
 	@echo "blackice_traffic build targets:"
+	@echo "  make test        - run the unit suite offscreen"
+	@echo "  make test-e2e    - run the end-to-end suite in a container (needs docker)"
 	@echo "  make venv        - create ./.venv and install requirements.txt"
 	@echo "  make bin         - build standalone binary via PyInstaller (host arch: $(HOST_ARCH))"
 	@echo "  make deb         - build .deb for host arch ($(HOST_ARCH))"
@@ -14,6 +16,14 @@ help:
 	@echo "  make distclean   - also remove ./.venv"
 	@echo ""
 	@echo "On a fresh machine just run 'make deb' - the build creates ./.venv itself."
+
+test:
+	QT_QPA_PLATFORM=offscreen $(or $(PYTHON),python3) -m unittest discover -s tests
+
+# Hermetic: a private network namespace whose socket table holds only what the
+# tests put there. See tests/e2e/README.md.
+test-e2e:
+	./tests/e2e/run.sh
 
 # Explicit target for anyone who wants the environment without a build;
 # build_linux_bin.sh creates the same .venv on demand, so it is optional.
